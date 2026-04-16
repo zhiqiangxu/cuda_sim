@@ -36,10 +36,33 @@ void test_normal() {
     printf("OK\n\n");
 }
 
+void test_buffer_overflow() {
+    printf("=== Test: buffer overflow ===\n");
+    char* ptr;
+    cudaMalloc((void**)&ptr, 64);
+    // Write past the end — corrupts back redzone
+    ptr[64] = 'X';
+    ptr[65] = 'Y';
+    cudaFree(ptr);  // should report overflow
+    printf("\n");
+}
+
+void test_buffer_underflow() {
+    printf("=== Test: buffer underflow ===\n");
+    char* ptr;
+    cudaMalloc((void**)&ptr, 64);
+    // Write before the start — corrupts front redzone
+    ptr[-1] = 'X';
+    cudaFree(ptr);  // should report underflow
+    printf("\n");
+}
+
 int main() {
     test_normal();
     test_double_free();
     test_invalid_free();
+    test_buffer_overflow();
+    test_buffer_underflow();
     test_leak();  // leak reported at exit
     return 0;
 }

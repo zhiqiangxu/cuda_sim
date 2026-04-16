@@ -26,9 +26,13 @@ enum cudaMemcpyKind {
 namespace cuda_sim {
 namespace detail {
 
+constexpr size_t REDZONE_SIZE = 16;
+constexpr uint8_t REDZONE_FILL = 0xAB;
+
 struct AllocInfo {
-    size_t size;
-    bool freed;  // true = already freed (kept for double-free detection)
+    void* real_ptr;   // actual malloc'd pointer (before front redzone)
+    size_t size;      // user-requested size
+    bool freed;
 };
 
 struct AllocTracker {
@@ -39,9 +43,9 @@ struct AllocTracker {
     size_t peak_usage = 0;
     size_t current_usage = 0;
 
-    void track_alloc(void* ptr, size_t size) {
+    void track_alloc(void* real_ptr, void* user_ptr, size_t size) {
         std::lock_guard<std::mutex> lock(mtx);
-        allocs[ptr] = {size, false};
+        allocs[user_ptr] = {real_ptr, size, false};
         total_allocated += size;
         current_usage += size;
         if (current_usage > peak_usage)
@@ -72,12 +76,37 @@ struct AllocTracker {
         return it != allocs.end() && !it->second.freed;
     }
 
+    bool check_redzone(void* user_ptr, const AllocInfo& info) {
+        auto* front = static_cast<uint8_t*>(info.real_ptr);
+        auto* back = static_cast<uint8_t*>(user_ptr) + info.size;
+        bool ok = true;
+        for (size_t i = 0; i < REDZONE_SIZE; i++) {
+            if (front[i] != REDZONE_FILL) {
+                fprintf(stderr, "[cuda_sim] ERROR: buffer underflow at %p (front redzone corrupted at byte %zu)\n",
+                        user_ptr, i);
+                ok = false;
+                break;
+            }
+        }
+        for (size_t i = 0; i < REDZONE_SIZE; i++) {
+            if (back[i] != REDZONE_FILL) {
+                fprintf(stderr, "[cuda_sim] ERROR: buffer overflow at %p (%zu bytes, back redzone corrupted at byte %zu)\n",
+                        user_ptr, info.size, i);
+                ok = false;
+                break;
+            }
+        }
+        return ok;
+    }
+
     void report() {
         std::lock_guard<std::mutex> lock(mtx);
         int leaks = 0;
         size_t leaked_bytes = 0;
         for (auto& [ptr, info] : allocs) {
             if (!info.freed) {
+                // Check redzone on leaked memory too
+                check_redzone(ptr, info);
                 leaks++;
                 leaked_bytes += info.size;
                 fprintf(stderr, "[cuda_sim] LEAK: %p (%zu bytes) never freed\n",
@@ -110,26 +139,51 @@ inline AllocTracker& tracker() {
 // ---------------------------------------------------------------------------
 
 inline cudaError_t cudaMalloc(void** ptr, size_t size) {
-    *ptr = std::malloc(size);
-    if (!*ptr) return cudaErrorMemoryAllocation;
-    cuda_sim::detail::tracker().track_alloc(*ptr, size);
+    // Allocate: [front redzone | user data | back redzone]
+    size_t total = cuda_sim::detail::REDZONE_SIZE + size + cuda_sim::detail::REDZONE_SIZE;
+    void* real_ptr = std::malloc(total);
+    if (!real_ptr) { *ptr = nullptr; return cudaErrorMemoryAllocation; }
+
+    auto* base = static_cast<uint8_t*>(real_ptr);
+    // Fill redzones with sentinel
+    std::memset(base, cuda_sim::detail::REDZONE_FILL, cuda_sim::detail::REDZONE_SIZE);
+    std::memset(base + cuda_sim::detail::REDZONE_SIZE + size,
+                cuda_sim::detail::REDZONE_FILL, cuda_sim::detail::REDZONE_SIZE);
+    // Zero user region
+    std::memset(base + cuda_sim::detail::REDZONE_SIZE, 0, size);
+
+    *ptr = base + cuda_sim::detail::REDZONE_SIZE;
+    cuda_sim::detail::tracker().track_alloc(real_ptr, *ptr, size);
     return cudaSuccess;
 }
 
 inline cudaError_t cudaFree(void* ptr) {
     if (!ptr) return cudaSuccess;
-    cudaError_t err = cuda_sim::detail::tracker().track_free(ptr);
-    if (err != cudaSuccess) return err;
-    // Poison freed memory to catch use-after-free
     auto& t = cuda_sim::detail::tracker();
+
+    // Check redzone before freeing
     {
         std::lock_guard<std::mutex> lock(t.mtx);
         auto it = t.allocs.find(ptr);
-        if (it != t.allocs.end()) {
-            std::memset(ptr, 0xDE, it->second.size);
+        if (it != t.allocs.end() && !it->second.freed) {
+            t.check_redzone(ptr, it->second);
         }
     }
-    std::free(ptr);
+
+    cudaError_t err = t.track_free(ptr);
+    if (err != cudaSuccess) return err;
+
+    // Poison user memory to catch use-after-free
+    void* real_ptr;
+    size_t size;
+    {
+        std::lock_guard<std::mutex> lock(t.mtx);
+        auto it = t.allocs.find(ptr);
+        real_ptr = it->second.real_ptr;
+        size = it->second.size;
+    }
+    std::memset(ptr, 0xDE, size);
+    std::free(real_ptr);
     return cudaSuccess;
 }
 
