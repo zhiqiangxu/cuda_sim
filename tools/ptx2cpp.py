@@ -81,6 +81,7 @@ class KernelDef:
     labels: set[str]
     shared_decls: list[SharedDecl] = field(default_factory=list)
     uses_shared_memory: bool = False
+    uses_warp: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +239,13 @@ class PTXParser:
             "shared" in inst.modifiers for inst in instructions
             if inst.opcode in ("ld", "st")
         )
+        uses_warp = any(
+            inst.opcode in ("shfl", "vote") for inst in instructions
+        )
         return KernelDef(name=name, params=params, registers=registers,
                          instructions=instructions, labels=labels,
-                         shared_decls=shared_decls, uses_shared_memory=uses_shared)
+                         shared_decls=shared_decls, uses_shared_memory=uses_shared,
+                         uses_warp=uses_warp)
 
     def _parse_instruction(self, line: str) -> Instruction | None:
         line = line.rstrip(";").strip()
@@ -275,7 +280,7 @@ class PTXParser:
                            operands=operands)
 
     def _parse_operands(self, text: str) -> list[str]:
-        """Parse operands handling [addr+offset] brackets."""
+        """Parse operands handling [addr+offset] brackets and dst|pred pipes."""
         operands = []
         current = ""
         bracket_depth = 0
@@ -295,7 +300,15 @@ class PTXParser:
 
         if current.strip():
             operands.append(current.strip())
-        return operands
+
+        # Expand pipe-separated operands: %r11|%p2 → ["%r11", "%p2"]
+        expanded = []
+        for op in operands:
+            if "|" in op and not op.startswith("["):
+                expanded.extend(p.strip() for p in op.split("|"))
+            else:
+                expanded.append(op)
+        return expanded
 
 
 # ---------------------------------------------------------------------------
@@ -659,9 +672,95 @@ class PTXTranslator:
 
         # --- Barrier ---
         if op == "bar":
-            if self.kernel.uses_shared_memory:
+            if self.kernel.uses_shared_memory or self.kernel.uses_warp:
                 return "__barrier->arrive_and_wait(); /* __syncthreads() */"
             return "/* __syncthreads() — no-op in sequential mode */;"
+
+        # --- Warp primitives ---
+        if op == "shfl":
+            # After pipe expansion: ops = [dst, pred, src, offset, clamp, mask]
+            # or without pred:      ops = [dst, src, offset, clamp, mask]
+            variant = None
+            for m in mods:
+                if m in ("down", "up", "idx", "bfly"):
+                    variant = m
+                    break
+            # Determine dst and src positions
+            # If second operand is a predicate (p[N]), it's the pipe-expanded pred
+            dst = ops[0]
+            if len(ops) >= 6 and "p[" in ops[1]:
+                pred = ops[1]
+                src = ops[2]
+                offset = ops[3]
+            else:
+                pred = None
+                src = ops[1]
+                offset = ops[2]
+
+            shfl_call = {
+                "down": f"__warp_ctx->shfl_down(__lane_id, {src}, {offset})",
+                "up":   f"__warp_ctx->shfl_up(__lane_id, {src}, {offset})",
+                "idx":  f"__warp_ctx->shfl_idx(__lane_id, {src}, {offset})",
+                "bfly": f"__warp_ctx->shfl_xor(__lane_id, {src}, {offset})",
+            }.get(variant)
+            if shfl_call is None:
+                return None
+            result = f"{dst} = {shfl_call};"
+            if pred:
+                result += f" {pred} = true;"
+            return result
+
+        if op == "vote":
+            # vote.sync.ballot.b32 %dst, %pred
+            if "ballot" in mods:
+                return f"{ops[0]} = __warp_ctx->ballot(__lane_id, {ops[1]});"
+            if "any" in mods:
+                return f"{ops[0]} = __warp_ctx->any(__lane_id, {ops[1]});"
+            if "all" in mods:
+                return f"{ops[0]} = __warp_ctx->all(__lane_id, {ops[1]});"
+            return None
+
+        if op == "match":
+            # match.any.sync.b32 %dst, %src, %mask
+            # match.all.sync.b32 %dst|%pred, %src, %mask
+            if "any" in mods:
+                return f"{ops[0]} = __warp_ctx->match_any(__lane_id, {ops[1]});"
+            if "all" in mods:
+                # ops may have pipe-expanded pred
+                if len(ops) >= 3 and "p[" in ops[1]:
+                    dst, pred, src = ops[0], ops[1], ops[2]
+                    return f"{{ bool __mp; {dst} = __warp_ctx->match_all(__lane_id, {src}, __mp); {pred} = __mp; }}"
+                return f"{{ bool __mp; {ops[0]} = __warp_ctx->match_all(__lane_id, {ops[1]}, __mp); }}"
+            return None
+
+        if op == "activemask":
+            return f"{ops[0]} = cuda_sim::WarpContext::activemask();"
+
+        # --- Bit operations ---
+        if op == "popc":
+            return f"{ops[0]} = cuda_sim::device_popc({ops[1]});"
+
+        if op == "clz":
+            return f"{ops[0]} = cuda_sim::device_clz({ops[1]});"
+
+        if op == "bfind":
+            return f"{ops[0]} = cuda_sim::device_bfind({ops[1]});"
+
+        if op == "brev":
+            return f"{ops[0]} = cuda_sim::device_brev({ops[1]});"
+
+        if op == "bfe":
+            # bfe.u32 %dst, %src, %start, %len
+            if type_mod and type_mod.startswith("s"):
+                return f"{ops[0]} = cuda_sim::device_bfe_signed((int32_t){ops[1]}, {ops[2]}, {ops[3]});"
+            return f"{ops[0]} = cuda_sim::device_bfe({ops[1]}, {ops[2]}, {ops[3]});"
+
+        if op == "bfi":
+            # bfi.b32 %dst, %src, %base, %start, %len
+            return f"{ops[0]} = cuda_sim::device_bfi({ops[1]}, {ops[2]}, {ops[3]}, {ops[4]});"
+
+        if op == "ffs":
+            return f"{ops[0]} = cuda_sim::device_ffs({ops[1]});"
 
         # --- No-op ---
         if op in ("nop", "membar", "fence"):
@@ -686,12 +785,14 @@ def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
     lines.append('#include "cuda_sim/runtime.h"')
     lines.append('#include "cuda_sim/device_atomic.h"')
 
-    # Check if any kernel uses shared memory
-    any_shared = any(k.uses_shared_memory for k in kernels)
-    if any_shared:
+    # Check if any kernel needs threading (shared memory or warp)
+    any_threaded = any(k.uses_shared_memory or k.uses_warp for k in kernels)
+    if any_threaded:
         lines.append("#include <thread>")
         lines.append("#include <vector>")
         lines.append('#include "cuda_sim/barrier.h"')
+    # Always include warp.h — it also has bit ops (popc, clz, bfe, etc.)
+    lines.append('#include "cuda_sim/warp.h"')
     lines.append("")
 
     for kernel in kernels:
@@ -701,6 +802,8 @@ def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
         num_instructions = len([i for i in kernel.instructions if i.opcode != "__label__"])
 
         uses_shared = kernel.uses_shared_memory
+        uses_warp = kernel.uses_warp
+        needs_threading = uses_shared or uses_warp
 
         # --- Thread function ---
         param_decls = []
@@ -718,7 +821,11 @@ def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
         # Shared memory parameters
         if uses_shared:
             param_decls.append("uint8_t* __shared_mem")
+        if needs_threading:
             param_decls.append("cuda_sim::SimpleBarrier* __barrier")
+        if uses_warp:
+            param_decls.append("cuda_sim::WarpContext* __warp_ctx")
+            param_decls.append("uint32_t __lane_id")
 
         lines.append(f"static void {kernel.name}_thread(")
         lines.append(f"    {(',{0}'.format(chr(10)) + '    ').join(param_decls)})")
@@ -772,21 +879,40 @@ def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
             "grid.x", "grid.y", "grid.z",
         ])
 
-        if uses_shared:
-            # Multi-threaded: spawn real threads per block for shared memory + barrier
-            call_args.extend(["shared_mem", "&barrier"])
+        if needs_threading:
+            # Multi-threaded: spawn real threads per block
+            if uses_shared:
+                call_args.append("shared_mem")
+            call_args.append("&barrier")
+            if uses_warp:
+                call_args.append("&warp_ctxs[thread_idx / 32]")
+                call_args.append("thread_idx % 32")
+
             lines.append("    for (uint32_t bz = 0; bz < grid.z; ++bz)")
             lines.append("    for (uint32_t by = 0; by < grid.y; ++by)")
             lines.append("    for (uint32_t bx = 0; bx < grid.x; ++bx) {")
-            lines.append(f"        uint8_t shared_mem[{shared_size}] = {{}};")
+            if uses_shared:
+                lines.append(f"        uint8_t shared_mem[{shared_size}] = {{}};")
             lines.append("        uint32_t num_threads = block.x * block.y * block.z;")
             lines.append("        cuda_sim::SimpleBarrier barrier(num_threads);")
+            if uses_warp:
+                lines.append("        uint32_t num_warps = (num_threads + 31) / 32;")
+                lines.append("        std::vector<cuda_sim::WarpContext> warp_ctxs(num_warps);")
+                lines.append("        // Resize warp barriers to actual warp size")
+                lines.append("        for (uint32_t w = 0; w < num_warps; w++) {")
+                lines.append("            uint32_t warp_size = (w == num_warps - 1 && num_threads % 32 != 0)")
+                lines.append("                ? num_threads % 32 : 32;")
+                lines.append("            warp_ctxs[w].barrier.reset(warp_size);")
+                lines.append("        }")
             lines.append("        std::vector<std::thread> threads;")
             lines.append("        threads.reserve(num_threads);")
+            lines.append("        uint32_t thread_idx = 0;")
             lines.append("        for (uint32_t tz = 0; tz < block.z; ++tz)")
             lines.append("        for (uint32_t ty = 0; ty < block.y; ++ty)")
-            lines.append("        for (uint32_t tx = 0; tx < block.x; ++tx)")
+            lines.append("        for (uint32_t tx = 0; tx < block.x; ++tx) {")
             lines.append(f"            threads.emplace_back({kernel.name}_thread, {', '.join(call_args)});")
+            lines.append("            thread_idx++;")
+            lines.append("        }")
             lines.append("        for (auto& t : threads) t.join();")
             lines.append("    }")
         else:

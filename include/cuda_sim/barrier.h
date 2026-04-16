@@ -10,8 +10,15 @@ namespace cuda_sim {
 /// Reusable: can be called multiple times (__syncthreads() may appear in a loop).
 class SimpleBarrier {
 public:
-    explicit SimpleBarrier(uint32_t count)
+    explicit SimpleBarrier(uint32_t count = 1)
         : threshold_(count), count_(count), generation_(0) {}
+
+    /// Reset the barrier for a new thread count (must not be called while threads are waiting)
+    void reset(uint32_t count) {
+        threshold_ = count;
+        count_ = count;
+        generation_ = 0;
+    }
 
     void arrive_and_wait() {
         std::unique_lock<std::mutex> lock(mtx_);
