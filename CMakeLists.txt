@@ -56,6 +56,29 @@ function(cuda_sim_add_executable TARGET PTX_FILE)
     cuda_sim_add_kernel(${TARGET} ${PTX_FILE})
 endfunction()
 
+# ---------------------------------------------------------------------------
+# cuda_sim_preprocess(input_file output_file)
+#
+# Convert <<<>>> launch syntax to _launch() calls.
+# Use this on host .cpp files that use CUDA kernel launch syntax.
+#
+# Usage:
+#   cuda_sim_preprocess(src/main_cuda.cpp ${CMAKE_CURRENT_BINARY_DIR}/main.cpp)
+#   add_executable(my_app ${CMAKE_CURRENT_BINARY_DIR}/main.cpp)
+#   cuda_sim_add_kernel(my_app kernel.ptx)
+# ---------------------------------------------------------------------------
+function(cuda_sim_preprocess INPUT_FILE OUTPUT_FILE)
+    set(PREPROCESS_PY "${CMAKE_SOURCE_DIR}/tools/cuda_preprocess.py")
+    add_custom_command(
+        OUTPUT ${OUTPUT_FILE}
+        COMMAND ${Python3_EXECUTABLE} ${PREPROCESS_PY}
+            ${CMAKE_CURRENT_SOURCE_DIR}/${INPUT_FILE}
+            -o ${OUTPUT_FILE}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${INPUT_FILE} ${PREPROCESS_PY}
+        COMMENT "cuda_preprocess: ${INPUT_FILE} (<<<>>> → _launch)"
+    )
+endfunction()
+
 # Examples
 add_subdirectory(examples/vector_add)
 add_subdirectory(examples/histogram)
