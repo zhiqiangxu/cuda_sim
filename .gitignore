@@ -1,0 +1,7 @@
+build/
+__pycache__/
+*.o
+*.pyc
+examples/*/app
+examples/*/kernel_real.ptx
+examples/*/kernel_cpu.cpp

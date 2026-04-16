@@ -1,0 +1,83 @@
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry reduce(
+    .param .u64 reduce_param_0,
+    .param .u64 reduce_param_1,
+    .param .u32 reduce_param_2
+) {
+    .reg .pred  %p<3>;
+    .reg .f32   %f<4>;
+    .reg .b32   %r<10>;
+    .reg .b64   %rd<8>;
+    .shared .align 4 .f32 sdata[256];
+
+    // tid = threadIdx.x
+    mov.u32       %r1, %tid.x;
+    // i = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32       %r2, %ctaid.x;
+    mov.u32       %r3, %ntid.x;
+    mad.lo.s32    %r4, %r2, %r3, %r1;
+
+    // sdata[tid] = (i < n) ? input[i] : 0.0f
+    ld.param.u32  %r5, [reduce_param_2];
+    setp.ge.s32   %p1, %r4, %r5;
+    @%p1 bra      $L__ZERO;
+
+    ld.param.u64  %rd1, [reduce_param_0];
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.s32  %rd3, %r4, 4;
+    add.s64       %rd4, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd4];
+    bra           $L__STORE;
+
+$L__ZERO:
+    mov.f32       %f1, 0f00000000;
+
+$L__STORE:
+    // sdata[tid] = f1
+    mul.wide.u32  %rd5, %r1, 4;
+    st.shared.f32 [sdata+%rd5], %f1;
+    bar.sync      0;
+
+    // Reduction loop: for (s = blockDim.x/2; s > 0; s >>= 1)
+    shr.u32       %r6, %r3, 1;
+
+$L__LOOP:
+    setp.eq.u32   %p2, %r6, 0;
+    @%p2 bra      $L__DONE;
+
+    // if (tid < s)
+    setp.ge.u32   %p1, %r1, %r6;
+    @%p1 bra      $L__SKIP;
+
+    // sdata[tid] += sdata[tid + s]
+    add.u32       %r7, %r1, %r6;
+    mul.wide.u32  %rd6, %r7, 4;
+    ld.shared.f32 %f2, [sdata+%rd6];
+    mul.wide.u32  %rd5, %r1, 4;
+    ld.shared.f32 %f1, [sdata+%rd5];
+    add.f32       %f3, %f1, %f2;
+    st.shared.f32 [sdata+%rd5], %f3;
+
+$L__SKIP:
+    bar.sync      0;
+    shr.u32       %r6, %r6, 1;
+    bra           $L__LOOP;
+
+$L__DONE:
+    // if (tid == 0) output[blockIdx.x] = sdata[0]
+    setp.ne.u32   %p1, %r1, 0;
+    @%p1 bra      $L__EXIT;
+
+    ld.shared.f32 %f1, [sdata];
+    ld.param.u64  %rd1, [reduce_param_1];
+    cvta.to.global.u64 %rd2, %rd1;
+    mul.wide.s32  %rd3, %r2, 4;
+    add.s64       %rd4, %rd2, %rd3;
+    st.global.f32 [%rd4], %f1;
+
+$L__EXIT:
+    ret;
+}

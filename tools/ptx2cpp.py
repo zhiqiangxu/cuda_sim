@@ -1,0 +1,885 @@
+#!/usr/bin/env python3
+"""PTX to C++ translator for cuda_sim.
+
+Translates NVIDIA PTX assembly into C++ code that can run on CPU,
+with a thread simulation wrapper (grid/block/thread loop).
+
+Usage:
+    python ptx2cpp.py kernel.ptx -o kernel_cpu.cpp
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Register:
+    """A PTX register: type prefix + index (e.g. %r3, %rd5, %f1, %p0)."""
+    prefix: str  # "r", "rd", "f", "fd", "p"
+    index: int
+
+    def cpp_name(self) -> str:
+        return f"{self.prefix}[{self.index}]"
+
+
+@dataclass
+class Param:
+    """A kernel parameter."""
+    name: str
+    ptx_type: str  # "u64", "u32", "s32", "f32", etc.
+
+    def cpp_type(self) -> str:
+        return PTX_TYPE_TO_CPP.get(self.ptx_type, "uint64_t")
+
+
+@dataclass
+class Instruction:
+    """A parsed PTX instruction."""
+    predicate: str | None  # e.g. "%p1" or None
+    pred_negate: bool      # @!%p1
+    opcode: str            # e.g. "add"
+    modifiers: list[str]   # e.g. ["lo", "s32"] from add.lo.s32
+    operands: list[str]    # raw operand strings
+    source_line: int = 0   # line number in original PTX
+
+
+@dataclass
+class Diagnostic:
+    """A warning or error from translation."""
+    line_number: int
+    severity: str   # "warning" or "error"
+    message: str
+
+    def __str__(self):
+        return f"ptx2cpp: {self.severity}: line {self.line_number}: {self.message}"
+
+
+@dataclass
+class SharedDecl:
+    """A .shared memory declaration."""
+    name: str
+    size: int       # total bytes
+    offset: int     # offset within shared memory buffer
+
+
+@dataclass
+class KernelDef:
+    """A parsed PTX kernel (.entry)."""
+    name: str
+    params: list[Param]
+    registers: dict[str, int]  # prefix -> count, e.g. {"r": 6, "rd": 11}
+    instructions: list[Instruction]
+    labels: set[str]
+    shared_decls: list[SharedDecl] = field(default_factory=list)
+    uses_shared_memory: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PTX_TYPE_TO_CPP = {
+    "u8":  "uint8_t",
+    "u16": "uint16_t",
+    "u32": "uint32_t",
+    "u64": "uint64_t",
+    "s8":  "int8_t",
+    "s16": "int16_t",
+    "s32": "int32_t",
+    "s64": "int64_t",
+    "b8":  "uint8_t",
+    "b16": "uint16_t",
+    "b32": "uint32_t",
+    "b64": "uint64_t",
+    "f32": "float",
+    "f64": "double",
+    "pred": "bool",
+}
+
+# Maps PTX register prefix to C++ type
+REG_PREFIX_TO_TYPE = {
+    "r":  "uint32_t",
+    "rd": "uint64_t",
+    "f":  "float",
+    "fd": "double",
+    "p":  "bool",
+}
+
+# Special registers
+SPECIAL_REGS = {
+    "%tid.x": "tid_x", "%tid.y": "tid_y", "%tid.z": "tid_z",
+    "%ctaid.x": "ctaid_x", "%ctaid.y": "ctaid_y", "%ctaid.z": "ctaid_z",
+    "%ntid.x": "ntid_x", "%ntid.y": "ntid_y", "%ntid.z": "ntid_z",
+    "%nctaid.x": "nctaid_x", "%nctaid.y": "nctaid_y", "%nctaid.z": "nctaid_z",
+}
+
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+class PTXParser:
+    """Parses PTX text into KernelDef structures."""
+
+    def __init__(self, text: str):
+        self.lines = text.splitlines()
+        self.pos = 0
+
+    def parse(self) -> list[KernelDef]:
+        kernels = []
+        while self.pos < len(self.lines):
+            line = self._current_line()
+            if ".entry" in line:
+                kernels.append(self._parse_kernel())
+            else:
+                self.pos += 1
+        return kernels
+
+    def _current_line(self) -> str:
+        return self.lines[self.pos].strip() if self.pos < len(self.lines) else ""
+
+    def _parse_kernel(self) -> KernelDef:
+        # Parse .entry line to get kernel name
+        line = self._current_line()
+        match = re.search(r'\.entry\s+(\w+)', line)
+        name = match.group(1) if match else "unknown_kernel"
+        self.pos += 1
+
+        # Parse parameters
+        params = []
+        while self.pos < len(self.lines):
+            line = self._current_line()
+            if "{" in line:
+                self.pos += 1
+                break
+            param_match = re.search(r'\.param\s+\.(\w+)\s+(\w+)', line)
+            if param_match:
+                params.append(Param(name=param_match.group(2),
+                                    ptx_type=param_match.group(1)))
+            self.pos += 1
+
+        # Parse body: registers, instructions, labels, shared memory
+        registers: dict[str, int] = {}
+        instructions: list[Instruction] = []
+        labels: set[str] = set()
+        shared_decls: list[SharedDecl] = []
+        shared_offset = 0
+
+        while self.pos < len(self.lines):
+            line = self._current_line()
+            self.pos += 1
+
+            if line == "}" or line.startswith("}"):
+                break
+            if not line or line.startswith("//"):
+                continue
+
+            # Register declarations: .reg .f32 %f<4>;
+            reg_match = re.match(r'\.reg\s+\.(\w+)\s+%(\w+)<(\d+)>', line)
+            if reg_match:
+                ptx_type = reg_match.group(1)
+                prefix = reg_match.group(2)
+                count = int(reg_match.group(3))
+                registers[prefix] = count
+                continue
+
+            # Shared memory declarations: .shared .align 4 .b8 smem[1024];
+            shared_match = re.match(
+                r'\.shared\s+(?:\.align\s+\d+\s+)?\.(\w+)\s+(\w+)\[(\d+)\]', line)
+            if shared_match:
+                elem_type = shared_match.group(1)
+                sname = shared_match.group(2)
+                count = int(shared_match.group(3))
+                # Calculate byte size from type
+                type_sizes = {"b8": 1, "b16": 2, "b32": 4, "b64": 8,
+                              "u8": 1, "u16": 2, "u32": 4, "u64": 8,
+                              "s8": 1, "s16": 2, "s32": 4, "s64": 8,
+                              "f32": 4, "f64": 8}
+                elem_size = type_sizes.get(elem_type, 1)
+                total_bytes = elem_size * count
+                # Align offset
+                align = max(elem_size, 4)
+                shared_offset = (shared_offset + align - 1) & ~(align - 1)
+                shared_decls.append(SharedDecl(sname, total_bytes, shared_offset))
+                shared_offset += total_bytes
+                continue
+
+            # Labels: $L__BB0_2:
+            label_match = re.match(r'(\$?\w+):', line)
+            if label_match:
+                label_name = label_match.group(1)
+                labels.add(label_name)
+                # Emit label as a pseudo-instruction
+                inst = Instruction(
+                    predicate=None, pred_negate=False,
+                    opcode="__label__", modifiers=[],
+                    operands=[label_name],
+                    source_line=self.pos
+                )
+                instructions.append(inst)
+                continue
+
+            # Instructions
+            inst = self._parse_instruction(line)
+            if inst:
+                inst.source_line = self.pos
+                instructions.append(inst)
+
+        uses_shared = len(shared_decls) > 0 or any(
+            "shared" in inst.modifiers for inst in instructions
+            if inst.opcode in ("ld", "st")
+        )
+        return KernelDef(name=name, params=params, registers=registers,
+                         instructions=instructions, labels=labels,
+                         shared_decls=shared_decls, uses_shared_memory=uses_shared)
+
+    def _parse_instruction(self, line: str) -> Instruction | None:
+        line = line.rstrip(";").strip()
+        if not line:
+            return None
+
+        # Handle predicate prefix: @%p1 or @!%p1
+        predicate = None
+        pred_negate = False
+        if line.startswith("@"):
+            pred_match = re.match(r'@(!?)(%\w+)\s+', line)
+            if pred_match:
+                pred_negate = pred_match.group(1) == "!"
+                predicate = pred_match.group(2)
+                line = line[pred_match.end():]
+
+        # Split opcode.modifiers from operands
+        parts = line.split(None, 1)
+        if not parts:
+            return None
+
+        opcode_parts = parts[0].split(".")
+        opcode = opcode_parts[0]
+        modifiers = opcode_parts[1:]
+
+        operands = []
+        if len(parts) > 1:
+            operands = self._parse_operands(parts[1])
+
+        return Instruction(predicate=predicate, pred_negate=pred_negate,
+                           opcode=opcode, modifiers=modifiers,
+                           operands=operands)
+
+    def _parse_operands(self, text: str) -> list[str]:
+        """Parse operands handling [addr+offset] brackets."""
+        operands = []
+        current = ""
+        bracket_depth = 0
+
+        for ch in text:
+            if ch == "[":
+                bracket_depth += 1
+                current += ch
+            elif ch == "]":
+                bracket_depth -= 1
+                current += ch
+            elif ch == "," and bracket_depth == 0:
+                operands.append(current.strip())
+                current = ""
+            else:
+                current += ch
+
+        if current.strip():
+            operands.append(current.strip())
+        return operands
+
+
+# ---------------------------------------------------------------------------
+# Translator
+# ---------------------------------------------------------------------------
+
+class PTXTranslator:
+    """Translates parsed PTX instructions into C++ statements."""
+
+    def __init__(self, kernel: KernelDef):
+        self.kernel = kernel
+        self.diagnostics: list[Diagnostic] = []
+        self.param_map: dict[str, str] = {}  # PTX param name -> C++ param name
+        for i, p in enumerate(kernel.params):
+            self.param_map[p.name] = f"param_{i}"
+        # Shared memory: name → offset in shared buffer
+        self.shared_map: dict[str, int] = {}
+        for sd in kernel.shared_decls:
+            self.shared_map[sd.name] = sd.offset
+
+    def translate_all(self) -> list[str]:
+        """Translate all instructions to C++ lines."""
+        lines = []
+        for inst in self.kernel.instructions:
+            cpp = self._translate_one(inst)
+            if cpp:
+                lines.append(cpp)
+        return lines
+
+    def _operand_to_cpp(self, op: str) -> str:
+        """Convert a PTX operand to C++ expression."""
+        # Special registers
+        if op in SPECIAL_REGS:
+            return SPECIAL_REGS[op]
+
+        # Register: %r3, %rd5, %f1, %p0
+        reg_match = re.match(r'^%(\w+?)(\d+)$', op)
+        if reg_match:
+            prefix = reg_match.group(1)
+            index = reg_match.group(2)
+            return f"{prefix}[{index}]"
+
+        # Memory operand: [name], [name+offset], [name+%reg], [%reg], [%reg+offset]
+        bracket_match = re.match(r'^\[(.+)\]$', op)
+        if bracket_match:
+            inner = bracket_match.group(1).strip()
+            # Split on '+' to get base and optional offset
+            parts = [p.strip() for p in inner.split("+", 1)]
+            base_str = parts[0]
+            offset_str = parts[1] if len(parts) > 1 else None
+
+            # Resolve base
+            if base_str in self.param_map:
+                base_cpp = self.param_map[base_str]
+            elif base_str in self.shared_map:
+                base_cpp = f"((uint64_t)__shared_mem + {self.shared_map[base_str]})"
+            elif base_str.startswith("%"):
+                base_cpp = self._operand_to_cpp(base_str)
+            else:
+                base_cpp = base_str
+
+            if offset_str is None:
+                return base_cpp
+
+            # Resolve offset (could be number or register)
+            if offset_str.startswith("%"):
+                offset_cpp = self._operand_to_cpp(offset_str)
+            else:
+                offset_cpp = offset_str
+
+            return f"({base_cpp} + {offset_cpp})"
+
+        # Immediate integer
+        if re.match(r'^-?\d+$', op):
+            return op
+
+        # Immediate float
+        if re.match(r'^0[fF][0-9a-fA-F]+$', op):
+            # PTX float hex literal: 0f3F800000 = 1.0f
+            hex_val = int(op[2:], 16)
+            import struct
+            float_val = struct.unpack('f', struct.pack('I', hex_val))[0]
+            return f"{float_val}f"
+
+        # Label
+        if op.startswith("$") or op.startswith("L_") or op.startswith("BB"):
+            return self._label_to_cpp(op)
+
+        return op
+
+    def _label_to_cpp(self, label: str) -> str:
+        """Convert PTX label to valid C++ label."""
+        return label.replace("$", "").replace(".", "_")
+
+    def _cast(self, type_mod: str, expr: str) -> str:
+        """Wrap expr in a C cast based on PTX type modifier."""
+        cpp_type = PTX_TYPE_TO_CPP.get(type_mod)
+        if cpp_type:
+            return f"({cpp_type})({expr})"
+        return expr
+
+    def _get_type_modifier(self) -> str | None:
+        """Get the last modifier that looks like a type."""
+        return None  # caller provides
+
+    def _ptr_type(self, type_mod: str) -> str:
+        """Get pointer type for load/store."""
+        cpp_type = PTX_TYPE_TO_CPP.get(type_mod, "uint32_t")
+        return cpp_type
+
+    def _translate_one(self, inst: Instruction) -> str | None:
+        """Translate a single instruction to C++."""
+        op = inst.opcode
+        mods = inst.modifiers
+        operands = inst.operands
+
+        # Label pseudo-instruction
+        if op == "__label__":
+            label = self._label_to_cpp(operands[0])
+            return f"{label}:;"
+
+        # Get C++ operand expressions
+        ops = [self._operand_to_cpp(o) for o in operands]
+
+        # Generate C++ statement
+        cpp = self._translate_opcode(op, mods, ops, operands)
+        if cpp is None:
+            full_inst = f"{op}.{'.'.join(mods)}" if mods else op
+            self.diagnostics.append(Diagnostic(
+                line_number=inst.source_line,
+                severity="warning",
+                message=f"unsupported instruction: {full_inst} {', '.join(operands)}"
+            ))
+            return f"// UNSUPPORTED: {full_inst} {', '.join(operands)}"
+
+        # Wrap in predicate
+        if inst.predicate:
+            pred_cpp = self._operand_to_cpp(inst.predicate)
+            cond = f"!{pred_cpp}" if inst.pred_negate else pred_cpp
+            cpp = f"if ({cond}) {{ {cpp} }}"
+
+        return cpp
+
+    def _translate_opcode(self, op: str, mods: list[str],
+                          ops: list[str], raw_ops: list[str]) -> str | None:
+        """Core translation: opcode + modifiers + operands → C++ statement."""
+
+        # Determine the type modifier (usually the last one)
+        type_mod = None
+        for m in reversed(mods):
+            if m in PTX_TYPE_TO_CPP:
+                type_mod = m
+                break
+
+        # --- Arithmetic ---
+        if op == "add":
+            if type_mod and type_mod.startswith("s"):
+                return f"{ops[0]} = {self._cast(type_mod, ops[1])} + {self._cast(type_mod, ops[2])};"
+            return f"{ops[0]} = {ops[1]} + {ops[2]};"
+
+        if op == "sub":
+            if type_mod and type_mod.startswith("s"):
+                return f"{ops[0]} = {self._cast(type_mod, ops[1])} - {self._cast(type_mod, ops[2])};"
+            return f"{ops[0]} = {ops[1]} - {ops[2]};"
+
+        if op == "mul":
+            if "wide" in mods:
+                # mul.wide.s32: 32-bit inputs → 64-bit result
+                return f"{ops[0]} = (int64_t){self._cast(type_mod, ops[1])} * {self._cast(type_mod, ops[2])};" if type_mod and type_mod.startswith("s") else \
+                       f"{ops[0]} = (uint64_t)({ops[1]}) * (uint64_t)({ops[2]});"
+            if "lo" in mods:
+                return f"{ops[0]} = {self._cast(type_mod, ops[1])} * {self._cast(type_mod, ops[2])};" if type_mod else \
+                       f"{ops[0]} = {ops[1]} * {ops[2]};"
+            if "hi" in mods and type_mod:
+                # mul.hi: return upper half of multiplication
+                sign = "int" if type_mod.startswith("s") else "uint"
+                wide = "64" if type_mod.endswith("32") else "128"
+                shift = int(wide) // 2
+                cpp_type = PTX_TYPE_TO_CPP[type_mod]
+                return f"{ops[0]} = ({cpp_type})(({sign}{wide}_t)({ops[1]}) * ({sign}{wide}_t)({ops[2]}) >> {shift});"
+            return f"{ops[0]} = {ops[1]} * {ops[2]};"
+
+        if op == "mad":
+            # mad.lo.s32 d, a, b, c → d = a * b + c
+            if type_mod and type_mod.startswith("s"):
+                return f"{ops[0]} = {self._cast(type_mod, ops[1])} * {self._cast(type_mod, ops[2])} + {self._cast(type_mod, ops[3])};"
+            return f"{ops[0]} = {ops[1]} * {ops[2]} + {ops[3]};"
+
+        if op == "div":
+            return f"{ops[0]} = {ops[1]} / {ops[2]};"
+
+        if op == "rem":
+            return f"{ops[0]} = {ops[1]} % {ops[2]};"
+
+        if op == "abs":
+            if type_mod and type_mod.startswith("f"):
+                return f"{ops[0]} = fabsf({ops[1]});" if type_mod == "f32" else f"{ops[0]} = fabs({ops[1]});"
+            return f"{ops[0]} = abs({self._cast(type_mod, ops[1])});" if type_mod else f"{ops[0]} = abs({ops[1]});"
+
+        if op == "neg":
+            return f"{ops[0]} = -{ops[1]};"
+
+        if op == "min":
+            return f"{ops[0]} = ({ops[1]} < {ops[2]}) ? {ops[1]} : {ops[2]};"
+
+        if op == "max":
+            return f"{ops[0]} = ({ops[1]} > {ops[2]}) ? {ops[1]} : {ops[2]};"
+
+        if op == "fma":
+            # fma.rn.f32 d, a, b, c → d = a*b + c
+            return f"{ops[0]} = std::fma({ops[1]}, {ops[2]}, {ops[3]});"
+
+        # --- Bitwise ---
+        if op == "and":
+            return f"{ops[0]} = {ops[1]} & {ops[2]};"
+        if op == "or":
+            return f"{ops[0]} = {ops[1]} | {ops[2]};"
+        if op == "xor":
+            return f"{ops[0]} = {ops[1]} ^ {ops[2]};"
+        if op == "not":
+            return f"{ops[0]} = ~{ops[1]};"
+
+        if op == "shl":
+            return f"{ops[0]} = {ops[1]} << {ops[2]};"
+        if op == "shr":
+            if type_mod and type_mod.startswith("s"):
+                return f"{ops[0]} = {self._cast(type_mod, ops[1])} >> {ops[2]};"
+            return f"{ops[0]} = {ops[1]} >> {ops[2]};"
+
+        # --- Move ---
+        if op == "mov":
+            # Check if source is a shared memory variable name
+            # On GPU, shared addresses are 32-bit offsets; we store the offset
+            raw_src = raw_ops[1] if len(raw_ops) > 1 else ""
+            if raw_src in self.shared_map:
+                return f"{ops[0]} = {self.shared_map[raw_src]}; /* shared addr: {raw_src} */"
+            return f"{ops[0]} = {ops[1]};"
+
+        # --- Load / Store ---
+        if op == "ld":
+            # ld.param.u64, ld.global.f32, ld.shared.f32, etc.
+            if "param" in mods:
+                return f"{ops[0]} = {ops[1]};"
+            ptr_type = self._ptr_type(type_mod) if type_mod else "uint32_t"
+            if "shared" in mods:
+                # Shared memory: operand is offset within __shared_mem
+                addr = ops[1]
+                if "__shared_mem" in addr:
+                    # Already resolved to __shared_mem + offset
+                    return f"{ops[0]} = *({ptr_type}*)({addr});"
+                else:
+                    # Register holding offset
+                    return f"{ops[0]} = *({ptr_type}*)(__shared_mem + (uint32_t)({addr}));"
+            # Global memory load
+            return f"{ops[0]} = *({ptr_type}*)({ops[1]});"
+
+        if op == "st":
+            ptr_type = self._ptr_type(type_mod) if type_mod else "uint32_t"
+            if "shared" in mods:
+                addr = ops[0]
+                if "__shared_mem" in addr:
+                    return f"*({ptr_type}*)({addr}) = {ops[1]};"
+                else:
+                    return f"*({ptr_type}*)(__shared_mem + (uint32_t)({addr})) = {ops[1]};"
+            # Global memory store
+            return f"*({ptr_type}*)({ops[0]}) = {ops[1]};"
+
+        # --- Address conversion ---
+        if op == "cvta":
+            # cvta.to.global.u64 — in CPU simulation, addresses are the same
+            return f"{ops[0]} = {ops[1]};"
+
+        # --- Type conversion ---
+        if op == "cvt":
+            # cvt.dst_type.src_type %dst, %src
+            # mods = ["rn", "f32", "s32"] or ["f32", "s32"]
+            dst_type = None
+            for m in mods:
+                if m in PTX_TYPE_TO_CPP:
+                    if dst_type is None:
+                        dst_type = m
+                    else:
+                        # second type is src_type, first is dst
+                        pass
+            if dst_type:
+                cpp_type = PTX_TYPE_TO_CPP[dst_type]
+                return f"{ops[0]} = ({cpp_type})({ops[1]});"
+            return f"{ops[0]} = {ops[1]};"
+
+        # --- Comparison ---
+        if op == "setp":
+            # setp.ge.s32 %p1, %r1, %r2
+            cmp_op = mods[0] if mods else "eq"
+            cmp_map = {
+                "eq": "==", "ne": "!=",
+                "lt": "<",  "le": "<=",
+                "gt": ">",  "ge": ">=",
+                "lo": "<",  "ls": "<=",
+                "hi": ">",  "hs": ">=",
+            }
+            cmp_sym = cmp_map.get(cmp_op, "==")
+            if type_mod and type_mod.startswith("s"):
+                return f"{ops[0]} = ({self._cast(type_mod, ops[1])} {cmp_sym} {self._cast(type_mod, ops[2])});"
+            return f"{ops[0]} = ({ops[1]} {cmp_sym} {ops[2]});"
+
+        if op == "selp":
+            # selp.type %d, %a, %b, %p → d = p ? a : b
+            return f"{ops[0]} = {ops[3]} ? {ops[1]} : {ops[2]};"
+
+        # --- Control flow ---
+        if op == "bra":
+            label = self._label_to_cpp(raw_ops[0])
+            return f"goto {label};"
+
+        if op == "ret":
+            return "return;"
+
+        # --- Math ---
+        if op == "sin":
+            return f"{ops[0]} = sinf({ops[1]});"
+        if op == "cos":
+            return f"{ops[0]} = cosf({ops[1]});"
+        if op == "sqrt":
+            if type_mod == "f64":
+                return f"{ops[0]} = sqrt({ops[1]});"
+            return f"{ops[0]} = sqrtf({ops[1]});"
+        if op == "rsqrt":
+            if type_mod == "f64":
+                return f"{ops[0]} = 1.0 / sqrt({ops[1]});"
+            return f"{ops[0]} = 1.0f / sqrtf({ops[1]});"
+        if op == "lg2":
+            return f"{ops[0]} = log2f({ops[1]});"
+        if op == "ex2":
+            return f"{ops[0]} = exp2f({ops[1]});"
+        if op == "rcp":
+            if type_mod == "f64":
+                return f"{ops[0]} = 1.0 / {ops[1]};"
+            return f"{ops[0]} = 1.0f / {ops[1]};"
+
+        # --- Atomic ---
+        if op == "atom":
+            # atom.global.add.s32 %r1, [%rd2], %r3
+            atom_op = None
+            for m in mods:
+                if m in ("add", "min", "max", "inc", "dec", "cas", "exch",
+                         "and", "or", "xor"):
+                    atom_op = m
+                    break
+            ptr_type = self._ptr_type(type_mod) if type_mod else "int32_t"
+            if atom_op == "add":
+                return f"{ops[0]} = cuda_sim::atomic_add(({ptr_type}*)({ops[1]}), ({ptr_type}){ops[2]});"
+            if atom_op == "cas":
+                return f"{ops[0]} = cuda_sim::atomic_cas(({ptr_type}*)({ops[1]}), ({ptr_type}){ops[2]}, ({ptr_type}){ops[3]});"
+            if atom_op == "exch":
+                return f"{ops[0]} = cuda_sim::atomic_exch(({ptr_type}*)({ops[1]}), ({ptr_type}){ops[2]});"
+            if atom_op == "min":
+                return f"{ops[0]} = cuda_sim::atomic_min(({ptr_type}*)({ops[1]}), ({ptr_type}){ops[2]});"
+            if atom_op == "max":
+                return f"{ops[0]} = cuda_sim::atomic_max(({ptr_type}*)({ops[1]}), ({ptr_type}){ops[2]});"
+            return None
+
+        # --- Barrier ---
+        if op == "bar":
+            if self.kernel.uses_shared_memory:
+                return "__barrier->arrive_and_wait(); /* __syncthreads() */"
+            return "/* __syncthreads() — no-op in sequential mode */;"
+
+        # --- No-op ---
+        if op in ("nop", "membar", "fence"):
+            return "/* memory fence — no-op in sequential mode */;"
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Code generator
+# ---------------------------------------------------------------------------
+
+def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
+    """Generate complete C++ file from translated kernels.
+    Returns (cpp_code, diagnostics)."""
+    all_diagnostics: list[Diagnostic] = []
+    lines = []
+    lines.append("// Auto-generated by ptx2cpp.py — do not edit")
+    lines.append("#include <cstdint>")
+    lines.append("#include <cmath>")
+    lines.append("#include <cstring>")
+    lines.append('#include "cuda_sim/runtime.h"')
+    lines.append('#include "cuda_sim/device_atomic.h"')
+
+    # Check if any kernel uses shared memory
+    any_shared = any(k.uses_shared_memory for k in kernels)
+    if any_shared:
+        lines.append("#include <thread>")
+        lines.append("#include <vector>")
+        lines.append('#include "cuda_sim/barrier.h"')
+    lines.append("")
+
+    for kernel in kernels:
+        translator = PTXTranslator(kernel)
+        cpp_lines = translator.translate_all()
+        all_diagnostics.extend(translator.diagnostics)
+        num_instructions = len([i for i in kernel.instructions if i.opcode != "__label__"])
+
+        uses_shared = kernel.uses_shared_memory
+
+        # --- Thread function ---
+        param_decls = []
+        for i, p in enumerate(kernel.params):
+            param_decls.append(f"{p.cpp_type()} param_{i}")
+
+        # Thread index parameters
+        param_decls.extend([
+            "uint32_t tid_x", "uint32_t tid_y", "uint32_t tid_z",
+            "uint32_t ctaid_x", "uint32_t ctaid_y", "uint32_t ctaid_z",
+            "uint32_t ntid_x", "uint32_t ntid_y", "uint32_t ntid_z",
+            "uint32_t nctaid_x", "uint32_t nctaid_y", "uint32_t nctaid_z",
+        ])
+
+        # Shared memory parameters
+        if uses_shared:
+            param_decls.append("uint8_t* __shared_mem")
+            param_decls.append("cuda_sim::SimpleBarrier* __barrier")
+
+        lines.append(f"static void {kernel.name}_thread(")
+        lines.append(f"    {(',{0}'.format(chr(10)) + '    ').join(param_decls)})")
+        lines.append("{")
+
+        # Register declarations
+        for prefix, count in sorted(kernel.registers.items()):
+            cpp_type = REG_PREFIX_TO_TYPE.get(prefix, "uint32_t")
+            lines.append(f"    {cpp_type} {prefix}[{count}] = {{}};")
+        if kernel.registers:
+            lines.append("")
+
+        # Instructions
+        for cpp_line in cpp_lines:
+            if cpp_line.endswith(":;"):
+                lines.append(cpp_line)
+            else:
+                lines.append(f"    {cpp_line}")
+
+        lines.append("}")
+        lines.append("")
+
+        # --- Launch wrapper ---
+        launch_params = []
+        for i, p in enumerate(kernel.params):
+            launch_params.append(f"{p.cpp_type()} param_{i}")
+        launch_params.append("cuda_sim::dim3 grid")
+        launch_params.append("cuda_sim::dim3 block")
+
+        lines.append(f'extern "C"')
+        lines.append(f"void {kernel.name}_launch(")
+        lines.append(f"    {(',{0}'.format(chr(10)) + '    ').join(launch_params)})")
+        lines.append("{")
+
+        # Calculate shared memory size
+        shared_size = 0
+        if uses_shared:
+            for sd in kernel.shared_decls:
+                end = sd.offset + sd.size
+                if end > shared_size:
+                    shared_size = end
+            # Round up to reasonable minimum
+            if shared_size == 0:
+                shared_size = 1024
+
+        call_args = [f"param_{i}" for i in range(len(kernel.params))]
+        call_args.extend([
+            "tx", "ty", "tz",
+            "bx", "by", "bz",
+            "block.x", "block.y", "block.z",
+            "grid.x", "grid.y", "grid.z",
+        ])
+
+        if uses_shared:
+            # Multi-threaded: spawn real threads per block for shared memory + barrier
+            call_args.extend(["shared_mem", "&barrier"])
+            lines.append("    for (uint32_t bz = 0; bz < grid.z; ++bz)")
+            lines.append("    for (uint32_t by = 0; by < grid.y; ++by)")
+            lines.append("    for (uint32_t bx = 0; bx < grid.x; ++bx) {")
+            lines.append(f"        uint8_t shared_mem[{shared_size}] = {{}};")
+            lines.append("        uint32_t num_threads = block.x * block.y * block.z;")
+            lines.append("        cuda_sim::SimpleBarrier barrier(num_threads);")
+            lines.append("        std::vector<std::thread> threads;")
+            lines.append("        threads.reserve(num_threads);")
+            lines.append("        for (uint32_t tz = 0; tz < block.z; ++tz)")
+            lines.append("        for (uint32_t ty = 0; ty < block.y; ++ty)")
+            lines.append("        for (uint32_t tx = 0; tx < block.x; ++tx)")
+            lines.append(f"            threads.emplace_back({kernel.name}_thread, {', '.join(call_args)});")
+            lines.append("        for (auto& t : threads) t.join();")
+            lines.append("    }")
+        else:
+            # Sequential: simple nested loop (fast, no threading overhead)
+            lines.append("    for (uint32_t bz = 0; bz < grid.z; ++bz)")
+            lines.append("    for (uint32_t by = 0; by < grid.y; ++by)")
+            lines.append("    for (uint32_t bx = 0; bx < grid.x; ++bx)")
+            lines.append("        for (uint32_t tz = 0; tz < block.z; ++tz)")
+            lines.append("        for (uint32_t ty = 0; ty < block.y; ++ty)")
+            lines.append("        for (uint32_t tx = 0; tx < block.x; ++tx)")
+            lines.append(f"            {kernel.name}_thread({', '.join(call_args)});")
+
+        lines.append("}")
+        lines.append("")
+
+        # --- Convenience wrapper: void* for pointer params ---
+        # u64 params are likely pointers; generate a void* overload
+        has_u64 = any(p.ptx_type in ("u64",) for p in kernel.params)
+        if has_u64:
+            wrapper_params = []
+            cast_args = []
+            for i, p in enumerate(kernel.params):
+                if p.ptx_type in ("u64",):
+                    wrapper_params.append(f"const void* param_{i}")
+                    cast_args.append(f"(uint64_t)param_{i}")
+                else:
+                    wrapper_params.append(f"{p.cpp_type()} param_{i}")
+                    cast_args.append(f"param_{i}")
+            wrapper_params.append("cuda_sim::dim3 grid")
+            wrapper_params.append("cuda_sim::dim3 block")
+            cast_args.extend(["grid", "block"])
+
+            lines.append(f"void {kernel.name}_launch(")
+            lines.append(f"    {(',{0}'.format(chr(10)) + '    ').join(wrapper_params)})")
+            lines.append("{")
+            lines.append(f"    {kernel.name}_launch({', '.join(cast_args)});")
+            lines.append("}")
+            lines.append("")
+
+    return "\n".join(lines), all_diagnostics
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Translate PTX to C++")
+    parser.add_argument("input", help="Input .ptx file")
+    parser.add_argument("-o", "--output", help="Output .cpp file (default: stdout)")
+    parser.add_argument("--strict", action="store_true",
+                        help="Treat unsupported instructions as errors")
+    args = parser.parse_args()
+
+    with open(args.input, "r") as f:
+        ptx_text = f.read()
+
+    ptx_parser = PTXParser(ptx_text)
+    kernels = ptx_parser.parse()
+
+    if not kernels:
+        print("Error: no kernels found in PTX file", file=sys.stderr)
+        sys.exit(1)
+
+    cpp_code, diagnostics = generate_cpp(kernels)
+
+    # Print diagnostics
+    for d in diagnostics:
+        print(str(d), file=sys.stderr)
+
+    # Summary
+    num_warnings = sum(1 for d in diagnostics if d.severity == "warning")
+    total_insts = sum(
+        len([i for i in k.instructions if i.opcode != "__label__"])
+        for k in kernels
+    )
+    summary = f"Generated {args.output or '<stdout>'} ({len(kernels)} kernel(s), {total_insts} instructions"
+    if num_warnings:
+        summary += f", {num_warnings} warning(s)"
+    summary += ")"
+    print(summary, file=sys.stderr)
+
+    # Strict mode: fail on warnings
+    if args.strict and diagnostics:
+        print("Error: unsupported instructions found (--strict mode)", file=sys.stderr)
+        sys.exit(1)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(cpp_code)
+    else:
+        print(cpp_code)
+
+
+if __name__ == "__main__":
+    main()
