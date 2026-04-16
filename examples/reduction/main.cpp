@@ -2,9 +2,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cuda_runtime.h>
-
-void reduce_launch(const void*, const void*, uint32_t,
-                   dim3, dim3);
+#include "kernel_cpu.h"
 
 int main() {
     // Use small N for testing (blockSize threads per block)

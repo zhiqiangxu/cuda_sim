@@ -2,11 +2,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cuda_runtime.h>
-
-// Use the void* convenience overload for pointer params
-// float param stays as float
-void saxpy_launch(float, const void*, const void*, uint32_t,
-                  dim3, dim3);
+#include "kernel_cpu.h"
 
 int main() {
     const int N = 512;

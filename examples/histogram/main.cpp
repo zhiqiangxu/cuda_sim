@@ -2,10 +2,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cuda_runtime.h>
-
-extern "C"
-void histogram_launch(uint64_t, uint64_t, uint32_t,
-                      dim3, dim3);
+#include "kernel_cpu.h"
 
 int main() {
     const int N = 1000;

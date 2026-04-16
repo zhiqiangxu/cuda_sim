@@ -12,19 +12,21 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 function(cuda_sim_add_executable TARGET PTX_FILE)
     get_filename_component(PTX_NAME ${PTX_FILE} NAME_WE)
     set(GENERATED_CPP "${CMAKE_CURRENT_BINARY_DIR}/${PTX_NAME}_cpu.cpp")
+    set(GENERATED_HDR "${CMAKE_CURRENT_BINARY_DIR}/${PTX_NAME}_cpu.h")
     set(PTX2CPP "${CMAKE_SOURCE_DIR}/tools/ptx2cpp.py")
 
-    # Custom command: ptx → cpp
+    # Custom command: ptx → cpp + header
     add_custom_command(
-        OUTPUT ${GENERATED_CPP}
-        COMMAND ${Python3_EXECUTABLE} ${PTX2CPP} ${CMAKE_CURRENT_SOURCE_DIR}/${PTX_FILE} -o ${GENERATED_CPP}
+        OUTPUT ${GENERATED_CPP} ${GENERATED_HDR}
+        COMMAND ${Python3_EXECUTABLE} ${PTX2CPP} ${CMAKE_CURRENT_SOURCE_DIR}/${PTX_FILE} -o ${GENERATED_CPP} -H ${GENERATED_HDR}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${PTX_FILE} ${PTX2CPP}
-        COMMENT "Translating ${PTX_FILE} → ${PTX_NAME}_cpu.cpp"
+        COMMENT "Translating ${PTX_FILE} → ${PTX_NAME}_cpu.cpp + ${PTX_NAME}_cpu.h"
     )
 
     # Build executable from host sources + generated kernel
     add_executable(${TARGET} ${ARGN} ${GENERATED_CPP})
     target_include_directories(${TARGET} PRIVATE
+        ${CMAKE_CURRENT_BINARY_DIR}
         ${CMAKE_SOURCE_DIR}/include/compat
         ${CMAKE_SOURCE_DIR}/include)
 endfunction()

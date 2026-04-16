@@ -2,9 +2,7 @@
 #include <cstdint>
 #include <cmath>
 #include <cuda_runtime.h>
-
-void matMul_launch(const void*, const void*, const void*, uint32_t,
-                   dim3, dim3);
+#include "kernel_cpu.h"
 
 int main() {
     // Small matrix for testing (TILE_SIZE=16, so use 16x16)
