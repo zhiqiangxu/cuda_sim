@@ -7,9 +7,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Find Python for ptx2cpp.py
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-# Helper function: translate PTX to C++ and build
-# Usage: cuda_sim_add_executable(target ptx_file main.cpp [extra.cpp ...])
-function(cuda_sim_add_executable TARGET PTX_FILE)
+# ---------------------------------------------------------------------------
+# cuda_sim_add_kernel(target ptx_file)
+#
+# Translate a .ptx file to C++ and add it to an existing target.
+# Also generates a .h header with launch declarations.
+#
+# Usage:
+#   add_executable(my_app src/main.cpp src/utils.cpp)
+#   cuda_sim_add_kernel(my_app kernels/physics.ptx)
+#   cuda_sim_add_kernel(my_app kernels/sort.ptx)
+# ---------------------------------------------------------------------------
+function(cuda_sim_add_kernel TARGET PTX_FILE)
     get_filename_component(PTX_NAME ${PTX_FILE} NAME_WE)
     set(GENERATED_CPP "${CMAKE_CURRENT_BINARY_DIR}/${PTX_NAME}_cpu.cpp")
     set(GENERATED_HDR "${CMAKE_CURRENT_BINARY_DIR}/${PTX_NAME}_cpu.h")
@@ -18,17 +27,33 @@ function(cuda_sim_add_executable TARGET PTX_FILE)
     # Custom command: ptx → cpp + header
     add_custom_command(
         OUTPUT ${GENERATED_CPP} ${GENERATED_HDR}
-        COMMAND ${Python3_EXECUTABLE} ${PTX2CPP} ${CMAKE_CURRENT_SOURCE_DIR}/${PTX_FILE} -o ${GENERATED_CPP} -H ${GENERATED_HDR}
+        COMMAND ${Python3_EXECUTABLE} ${PTX2CPP}
+            ${CMAKE_CURRENT_SOURCE_DIR}/${PTX_FILE}
+            -o ${GENERATED_CPP}
+            -H ${GENERATED_HDR}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${PTX_FILE} ${PTX2CPP}
-        COMMENT "Translating ${PTX_FILE} → ${PTX_NAME}_cpu.cpp + ${PTX_NAME}_cpu.h"
+        COMMENT "ptx2cpp: ${PTX_FILE} → ${PTX_NAME}_cpu.cpp + .h"
     )
 
-    # Build executable from host sources + generated kernel
-    add_executable(${TARGET} ${ARGN} ${GENERATED_CPP})
+    # Add generated source to target
+    target_sources(${TARGET} PRIVATE ${GENERATED_CPP})
+
+    # Add include paths for generated header + cuda_sim headers
     target_include_directories(${TARGET} PRIVATE
         ${CMAKE_CURRENT_BINARY_DIR}
         ${CMAKE_SOURCE_DIR}/include/compat
         ${CMAKE_SOURCE_DIR}/include)
+endfunction()
+
+# ---------------------------------------------------------------------------
+# cuda_sim_add_executable(target ptx_file source1 [source2 ...])
+#
+# Convenience: create executable + add kernel in one call.
+# For simple single-kernel examples.
+# ---------------------------------------------------------------------------
+function(cuda_sim_add_executable TARGET PTX_FILE)
+    add_executable(${TARGET} ${ARGN})
+    cuda_sim_add_kernel(${TARGET} ${PTX_FILE})
 endfunction()
 
 # Examples

@@ -45,12 +45,24 @@ make
 ctest
 ```
 
-CMake automatically runs ptx2cpp.py on `.ptx` files. To add your own kernel:
+### Integrating with your project
 
 ```cmake
-# In your CMakeLists.txt
+# Simple: single kernel, single executable
 cuda_sim_add_executable(my_app kernel.ptx main.cpp)
+
+# Flexible: add kernels to an existing target with multiple sources
+add_executable(my_app
+    src/main.cpp
+    src/utils.cpp
+    src/renderer.cpp
+)
+cuda_sim_add_kernel(my_app kernels/physics.ptx)
+cuda_sim_add_kernel(my_app kernels/sort.ptx)
+target_link_libraries(my_app PRIVATE some_lib)
 ```
+
+`cuda_sim_add_kernel` translates `.ptx` → `.cpp` + `.h`, adds to your target, and sets up include paths. The generated `kernel_cpu.h` contains launch function declarations.
 
 ## Host code compatibility
 
