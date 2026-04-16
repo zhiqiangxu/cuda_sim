@@ -595,18 +595,38 @@ class PTXTranslator:
 
         # --- Type conversion ---
         if op == "cvt":
-            # cvt.dst_type.src_type %dst, %src
-            # mods = ["rn", "f32", "s32"] or ["f32", "s32"]
+            # cvt.[rounding].dst_type.src_type %dst, %src
+            # rounding: rn (nearest), rz (zero), rm (minus inf), rp (plus inf)
+            #           rni/rzi/rmi/rpi (integer rounding variants)
             dst_type = None
+            src_type = None
+            rounding = None
             for m in mods:
-                if m in PTX_TYPE_TO_CPP:
+                if m in ("rn", "rz", "rm", "rp", "rni", "rzi", "rmi", "rpi"):
+                    rounding = m
+                elif m in PTX_TYPE_TO_CPP:
                     if dst_type is None:
                         dst_type = m
                     else:
-                        # second type is src_type, first is dst
-                        pass
-            if dst_type:
-                cpp_type = PTX_TYPE_TO_CPP[dst_type]
+                        src_type = m
+            cpp_type = PTX_TYPE_TO_CPP.get(dst_type, "uint32_t") if dst_type else None
+
+            # Float→int with rounding
+            if rounding and cpp_type and dst_type and dst_type.startswith(("s", "u")):
+                if rounding in ("rni", "rn"):
+                    return f"{ops[0]} = ({cpp_type})lrintf({ops[1]});"
+                if rounding in ("rzi", "rz"):
+                    return f"{ops[0]} = ({cpp_type})({ops[1]});"  # truncation (default C cast)
+                if rounding in ("rmi", "rm"):
+                    return f"{ops[0]} = ({cpp_type})floorf({ops[1]});"
+                if rounding in ("rpi", "rp"):
+                    return f"{ops[0]} = ({cpp_type})ceilf({ops[1]});"
+
+            # Float→float with rounding (e.g. f64→f32)
+            if rounding and cpp_type and dst_type and dst_type.startswith("f"):
+                return f"{ops[0]} = ({cpp_type})({ops[1]});"
+
+            if cpp_type:
                 return f"{ops[0]} = ({cpp_type})({ops[1]});"
             return f"{ops[0]} = {ops[1]};"
 
