@@ -86,25 +86,27 @@ Compile with `-Iinclude/compat -Iinclude` and our headers intercept `<cuda_runti
 
 All examples verified with real nvcc-generated PTX.
 
-## Supported PTX instructions (46)
+## Supported PTX instructions (56)
 
-**Arithmetic**: add, sub, mul, mad, div, rem, fma, abs, neg, min, max
+**Arithmetic**: add, sub, mul, mad, div, rem, fma, abs, neg, min, max, sad
 
 **Bitwise**: and, or, xor, not, shl, shr
 
-**Memory**: ld (param/global/shared), st (global/shared), cvta
+**Memory**: ld (param/global/shared), st (global/shared), cvta, prefetch, red
 
-**Control flow**: mov, setp, selp, bra, ret, bar (syncthreads)
+**Control flow**: mov, setp, selp, slct, bra, ret, exit, bar (syncthreads), trap, brkpt
 
-**Type conversion**: cvt
+**Type conversion**: cvt, copysign, prmt
 
-**Math**: sin, cos, sqrt, rsqrt, rcp, lg2, ex2
+**Math**: sin, cos, sqrt, rsqrt, rcp, lg2, ex2, testp
 
 **Atomics**: atom (add/cas/exch/min/max)
 
 **Warp**: shfl (down/up/idx/xor), vote (ballot/any/all), match (any/all), activemask
 
 **Bit ops**: popc, clz, bfind, brev, bfe, bfi, ffs
+
+**Misc**: isspacep, nop, membar, fence
 
 ## Memory error detection
 
@@ -127,7 +129,7 @@ Built-in runtime checks (no extra flags needed):
 ## Limitations
 
 - Kernel launch uses `xxx_launch()` instead of `<<<>>>` syntax
-- ~46 of ~200 PTX instructions supported (covers most common kernels)
+- ~56 of ~200 PTX instructions supported (covers most common kernels)
 - Unsupported instructions produce a warning and `// UNSUPPORTED` comment
 - Use `--strict` flag to fail on unsupported instructions
 - No texture/surface memory, no CUDA streams, no dynamic parallelism

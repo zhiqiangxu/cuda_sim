@@ -762,6 +762,90 @@ class PTXTranslator:
         if op == "ffs":
             return f"{ops[0]} = cuda_sim::device_ffs({ops[1]});"
 
+        # --- Additional instructions ---
+
+        # copysign: copy sign of b to magnitude of a
+        if op == "copysign":
+            if type_mod == "f64":
+                return f"{ops[0]} = copysign({ops[1]}, {ops[2]});"
+            return f"{ops[0]} = copysignf({ops[1]}, {ops[2]});"
+
+        # slct: select a or b based on sign of c
+        if op == "slct":
+            # slct.type.cmp_type %dst, %a, %b, %c → dst = (c >= 0) ? a : b
+            return f"{ops[0]} = ({ops[3]} >= 0) ? {ops[1]} : {ops[2]};"
+
+        # sad: sum of absolute differences
+        if op == "sad":
+            # sad.type %dst, %a, %b, %c → dst = |a - b| + c
+            if type_mod and type_mod.startswith("s"):
+                return f"{ops[0]} = abs((int32_t){ops[1]} - (int32_t){ops[2]}) + {ops[3]};"
+            return f"{ops[0]} = (({ops[1]} > {ops[2]}) ? ({ops[1]} - {ops[2]}) : ({ops[2]} - {ops[1]})) + {ops[3]};"
+
+        # prmt: permute bytes from two 32-bit values
+        if op == "prmt":
+            # prmt.b32 %dst, %a, %b, %selector
+            return f"""{{ uint32_t __ab[8]; uint32_t __a = {ops[1]}, __b = {ops[2]}, __s = {ops[3]};
+    for (int __i = 0; __i < 4; __i++) __ab[__i] = (__a >> (__i*8)) & 0xFF;
+    for (int __i = 0; __i < 4; __i++) __ab[4+__i] = (__b >> (__i*8)) & 0xFF;
+    {ops[0]} = 0;
+    for (int __i = 0; __i < 4; __i++) {ops[0]} |= __ab[(__s >> (__i*4)) & 0x7] << (__i*8); }}"""
+
+        # testp: test floating point property
+        if op == "testp":
+            # testp.{finite,infinite,number,notanumber,normal,subnormal} %pred, %src
+            prop = mods[0] if mods else ""
+            if prop == "finite":
+                return f"{ops[0]} = std::isfinite({ops[1]});"
+            if prop in ("infinite", "inf"):
+                return f"{ops[0]} = std::isinf({ops[1]});"
+            if prop == "number":
+                return f"{ops[0]} = !std::isnan({ops[1]});"
+            if prop in ("notanumber", "nan"):
+                return f"{ops[0]} = std::isnan({ops[1]});"
+            if prop == "normal":
+                return f"{ops[0]} = std::isnormal({ops[1]});"
+            if prop == "subnormal":
+                return f"{ops[0]} = (std::fpclassify({ops[1]}) == FP_SUBNORMAL);"
+            return None
+
+        # red: reduction on global/shared memory (similar to atom but no return)
+        if op == "red":
+            # red.global.add.s32 [addr], val
+            atom_op = None
+            for m in mods:
+                if m in ("add", "min", "max", "and", "or", "xor", "inc", "dec"):
+                    atom_op = m
+                    break
+            ptr_type = self._ptr_type(type_mod) if type_mod else "int32_t"
+            if atom_op == "add":
+                return f"cuda_sim::atomic_add(({ptr_type}*)({ops[0]}), ({ptr_type}){ops[1]});"
+            if atom_op == "min":
+                return f"cuda_sim::atomic_min(({ptr_type}*)({ops[0]}), ({ptr_type}){ops[1]});"
+            if atom_op == "max":
+                return f"cuda_sim::atomic_max(({ptr_type}*)({ops[0]}), ({ptr_type}){ops[1]});"
+            return None
+
+        # exit: terminate thread
+        if op == "exit":
+            return "return;"
+
+        # trap: trigger error
+        if op == "trap":
+            return 'fprintf(stderr, "cuda_sim: trap instruction hit\\n"); return;'
+
+        # brkpt: breakpoint (debug)
+        if op == "brkpt":
+            return "/* breakpoint */;"
+
+        # prefetch / prefetchu: cache hint — no-op on CPU
+        if op in ("prefetch", "prefetchu"):
+            return "/* prefetch — no-op on CPU */;"
+
+        # isspacep: test address space — always true for global on CPU
+        if op == "isspacep":
+            return f"{ops[0]} = true; /* address space check — trivially true on CPU */;"
+
         # --- No-op ---
         if op in ("nop", "membar", "fence"):
             return "/* memory fence — no-op in sequential mode */;"

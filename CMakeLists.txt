@@ -35,6 +35,7 @@ add_subdirectory(examples/histogram)
 add_subdirectory(examples/reduction)
 add_subdirectory(examples/matrix_mul)
 add_subdirectory(examples/saxpy)
+add_subdirectory(examples/warp_reduce)
 
 # Tests
 enable_testing()
@@ -43,6 +44,7 @@ add_test(NAME test_histogram COMMAND histogram_example)
 add_test(NAME test_reduction COMMAND reduction_example)
 add_test(NAME test_matrix_mul COMMAND matrix_mul_example)
 add_test(NAME test_saxpy COMMAND saxpy_example)
+add_test(NAME test_warp_reduce COMMAND warp_reduce_example)
 add_test(NAME test_ptx_parser
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_ptx_parser.py
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
