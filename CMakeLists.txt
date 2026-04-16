@@ -79,6 +79,30 @@ function(cuda_sim_preprocess INPUT_FILE OUTPUT_FILE)
     )
 endfunction()
 
+# ---------------------------------------------------------------------------
+# cuda_sim_add_sources(target source1 [source2 ...])
+#
+# Add host source files to target, auto-preprocessing <<<>>> syntax.
+# Use this for .cpp files that contain CUDA kernel launch syntax.
+# Files without <<<>>> pass through unchanged (just a copy).
+# ---------------------------------------------------------------------------
+function(cuda_sim_add_sources TARGET)
+    set(PREPROCESS_PY "${CMAKE_SOURCE_DIR}/tools/cuda_preprocess.py")
+    foreach(SRC ${ARGN})
+        get_filename_component(SRC_NAME ${SRC} NAME)
+        set(PROCESSED "${CMAKE_CURRENT_BINARY_DIR}/pp_${SRC_NAME}")
+        add_custom_command(
+            OUTPUT ${PROCESSED}
+            COMMAND ${Python3_EXECUTABLE} ${PREPROCESS_PY}
+                ${CMAKE_CURRENT_SOURCE_DIR}/${SRC}
+                -o ${PROCESSED}
+            DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SRC} ${PREPROCESS_PY}
+            COMMENT "cuda_preprocess: ${SRC}"
+        )
+        target_sources(${TARGET} PRIVATE ${PROCESSED})
+    endforeach()
+endfunction()
+
 # Examples
 add_subdirectory(examples/vector_add)
 add_subdirectory(examples/histogram)
@@ -88,6 +112,7 @@ add_subdirectory(examples/saxpy)
 add_subdirectory(examples/warp_reduce)
 add_subdirectory(examples/softmax)
 add_subdirectory(examples/relu)
+add_subdirectory(examples/native_syntax)
 
 # Tests
 enable_testing()
@@ -99,6 +124,7 @@ add_test(NAME test_saxpy COMMAND saxpy_example)
 add_test(NAME test_warp_reduce COMMAND warp_reduce_example)
 add_test(NAME test_softmax COMMAND softmax_example)
 add_test(NAME test_relu COMMAND relu_example)
+add_test(NAME test_native_syntax COMMAND native_syntax_example)
 add_test(NAME test_ptx_parser
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/test_ptx_parser.py
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
