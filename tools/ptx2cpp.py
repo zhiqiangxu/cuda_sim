@@ -81,6 +81,7 @@ class KernelDef:
     labels: set[str]
     shared_decls: list[SharedDecl] = field(default_factory=list)
     uses_shared_memory: bool = False
+    has_dynamic_shared: bool = False
     uses_warp: bool = False
 
 
@@ -193,7 +194,17 @@ class PTXParser:
                 registers[prefix] = count
                 continue
 
-            # Shared memory declarations: .shared .align 4 .b8 smem[1024];
+            # Extern shared memory: .extern .shared .align 4 .b8 smem[];
+            extern_shared_match = re.match(
+                r'\.extern\s+\.shared\s+(?:\.align\s+\d+\s+)?\.(\w+)\s+(\w+)\[\]', line)
+            if extern_shared_match:
+                sname = extern_shared_match.group(2)
+                # Dynamic shared memory — offset is at the end of static shared
+                # Size is determined at launch time
+                shared_decls.append(SharedDecl(sname, 0, shared_offset))
+                continue
+
+            # Static shared memory: .shared .align 4 .b8 smem[1024];
             shared_match = re.match(
                 r'\.shared\s+(?:\.align\s+\d+\s+)?\.(\w+)\s+(\w+)\[(\d+)\]', line)
             if shared_match:
@@ -239,13 +250,14 @@ class PTXParser:
             "shared" in inst.modifiers for inst in instructions
             if inst.opcode in ("ld", "st")
         )
+        has_dynamic = any(sd.size == 0 for sd in shared_decls)
         uses_warp = any(
             inst.opcode in ("shfl", "vote") for inst in instructions
         )
         return KernelDef(name=name, params=params, registers=registers,
                          instructions=instructions, labels=labels,
                          shared_decls=shared_decls, uses_shared_memory=uses_shared,
-                         uses_warp=uses_warp)
+                         has_dynamic_shared=has_dynamic, uses_warp=uses_warp)
 
     def _parse_instruction(self, line: str) -> Instruction | None:
         line = line.rstrip(";").strip()
@@ -938,22 +950,23 @@ def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
             launch_params.append(f"{p.cpp_type()} param_{i}")
         launch_params.append("cuda_sim::dim3 grid")
         launch_params.append("cuda_sim::dim3 block")
+        if kernel.has_dynamic_shared:
+            launch_params.append("size_t shared_mem_bytes = 0")
 
         lines.append(f'extern "C"')
         lines.append(f"void {kernel.name}_launch(")
         lines.append(f"    {(',{0}'.format(chr(10)) + '    ').join(launch_params)})")
         lines.append("{")
 
-        # Calculate shared memory size
-        shared_size = 0
+        # Calculate shared memory size (static part)
+        static_shared_size = 0
         if uses_shared:
             for sd in kernel.shared_decls:
                 end = sd.offset + sd.size
-                if end > shared_size:
-                    shared_size = end
-            # Round up to reasonable minimum
-            if shared_size == 0:
-                shared_size = 1024
+                if end > static_shared_size:
+                    static_shared_size = end
+            if static_shared_size == 0 and not kernel.has_dynamic_shared:
+                static_shared_size = 1024
 
         call_args = [f"param_{i}" for i in range(len(kernel.params))]
         call_args.extend([
@@ -976,7 +989,12 @@ def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
             lines.append("    for (uint32_t by = 0; by < grid.y; ++by)")
             lines.append("    for (uint32_t bx = 0; bx < grid.x; ++bx) {")
             if uses_shared:
-                lines.append(f"        uint8_t shared_mem[{shared_size}] = {{}};")
+                if kernel.has_dynamic_shared:
+                    lines.append(f"        size_t __total_shared = {static_shared_size} + shared_mem_bytes;")
+                    lines.append("        std::vector<uint8_t> shared_vec(__total_shared, 0);")
+                    lines.append("        uint8_t* shared_mem = shared_vec.data();")
+                else:
+                    lines.append(f"        uint8_t shared_mem[{static_shared_size}] = {{}};")
             lines.append("        uint32_t num_threads = block.x * block.y * block.z;")
             lines.append("        cuda_sim::SimpleBarrier barrier(num_threads);")
             if uses_warp:
@@ -1053,12 +1071,16 @@ def generate_header(kernels: list[KernelDef]) -> str:
     lines.append("")
 
     for kernel in kernels:
+        dyn_param = ", size_t shared_mem_bytes = 0" if kernel.has_dynamic_shared else ""
+
         # extern "C" raw launch function
         raw_params = []
         for i, p in enumerate(kernel.params):
             raw_params.append(f"{p.cpp_type()} param_{i}")
         raw_params.append("dim3 grid")
         raw_params.append("dim3 block")
+        if kernel.has_dynamic_shared:
+            raw_params.append("size_t shared_mem_bytes = 0")
 
         lines.append(f'extern "C" void {kernel.name}_launch(')
         lines.append(f"    {(',{0}'.format(chr(10)) + '    ').join(raw_params)});")
@@ -1075,6 +1097,8 @@ def generate_header(kernels: list[KernelDef]) -> str:
                     wrapper_params.append(f"{p.cpp_type()} param_{i}")
             wrapper_params.append("dim3 grid")
             wrapper_params.append("dim3 block")
+            if kernel.has_dynamic_shared:
+                wrapper_params.append("size_t shared_mem_bytes = 0")
 
             lines.append(f"void {kernel.name}_launch(")
             lines.append(f"    {(',{0}'.format(chr(10)) + '    ').join(wrapper_params)});")
