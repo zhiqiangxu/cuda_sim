@@ -186,6 +186,8 @@ Built into `cuda_runtime_api.h`, always active:
 | Double free | Check if pointer already freed |
 | Invalid free | Check if pointer was ever allocated |
 | Use-after-free | Poison freed memory with 0xDE |
+| Buffer overflow | 16-byte redzone after each allocation, checked on free |
+| Buffer underflow | 16-byte redzone before each allocation, checked on free |
 
 ---
 
@@ -208,22 +210,29 @@ CUDA is only needed at **compile time** to generate PTX. The final binary is a *
 cuda_sim/
 ├── README.md
 ├── ARCHITECTURE.md
+├── LICENSE
 ├── CMakeLists.txt
-├── cuda-sim-build.sh
+│
+├── cmake/
+│   └── CudaSimConfig.cmake     # For external project integration
 │
 ├── docker/
 │   ├── Dockerfile
 │   └── generate_ptx.sh
 │
 ├── tools/
-│   └── ptx2cpp.py              # Core: PTX → C++ translator
+│   ├── ptx2cpp.py              # Core: PTX → C++ translator
+│   └── cuda_preprocess.py      # <<<>>> syntax → _launch() calls
 │
 ├── include/
-│   ├── compat/
-│   │   ├── cuda_runtime.h      # Drop-in for #include <cuda_runtime.h>
-│   │   └── cuda_runtime_api.h
+│   ├── compat/                 # Drop-in replacements for CUDA headers
+│   │   ├── cuda_runtime.h
+│   │   ├── cuda_runtime_api.h
+│   │   ├── cuda.h
+│   │   ├── cuda_fp16.h
+│   │   └── device_launch_parameters.h
 │   └── cuda_sim/
-│       ├── cuda_runtime_api.h  # cudaMalloc/Free/Memcpy + error detection
+│       ├── cuda_runtime_api.h  # cudaMalloc/Free/Memcpy + error detection + redzone
 │       ├── runtime.h           # dim3
 │       ├── device_atomic.h     # atomic_add, atomic_cas, etc.
 │       ├── barrier.h           # SimpleBarrier for __syncthreads()
@@ -235,7 +244,10 @@ cuda_sim/
 │   ├── reduction/              # shared memory + syncthreads
 │   ├── matrix_mul/             # 2D shared tiles, 2D grid/block
 │   ├── saxpy/                  # multiple kernels, float params
-│   └── warp_reduce/            # __shfl_down_sync
+│   ├── warp_reduce/            # __shfl_down_sync
+│   ├── softmax/                # shared memory reduction, expf
+│   ├── relu/                   # 3 kernels, type conversions with rounding
+│   └── native_syntax/          # real <<<>>> syntax, auto-preprocessed
 │
 └── tests/
     ├── test_ptx_parser.py      # Parser + translator unit tests
@@ -254,7 +266,7 @@ cuda_sim/
 
 **Control flow**: mov, setp, selp, slct, bra, ret, exit, bar, trap, brkpt
 
-**Type conversion**: cvt, copysign, prmt
+**Type conversion**: cvt (with rounding modes: rn/rz/rm/rp), copysign, prmt
 
 **Math**: sin, cos, sqrt, rsqrt, rcp, lg2, ex2, testp
 
@@ -270,13 +282,17 @@ cuda_sim/
 
 ## Verified Examples
 
-All examples tested with **real nvcc-generated PTX** (CUDA 12.6, Docker):
+All examples tested with **real nvcc-generated PTX** (CUDA 12.6, Docker).
+10 tests passing on Ubuntu and macOS (GitHub Actions CI).
 
-| Example | Features | Threads per block |
-|---------|----------|-------------------|
-| vector_add | 1D, global memory | 256 (sequential) |
-| histogram | atomicAdd | 256 (sequential) |
-| reduction | shared memory, syncthreads | 32 (multi-threaded) |
-| matrix_mul | 2D shared tiles, 2D grid | 256 (multi-threaded) |
-| saxpy | 2 kernels, float params | 256 (sequential) |
-| warp_reduce | shfl_down_sync | 32 (multi-threaded + warp) |
+| Example | Features | Execution mode |
+|---------|----------|----------------|
+| vector_add | 1D, global memory | sequential |
+| histogram | atomicAdd | sequential |
+| reduction | shared memory, syncthreads | multi-threaded |
+| matrix_mul | 2D shared tiles, 2D grid | multi-threaded |
+| saxpy | 2 kernels, float params | sequential |
+| warp_reduce | shfl_down_sync | multi-threaded + warp |
+| softmax | shared memory reduction, expf, complex flow | multi-threaded |
+| relu | 3 kernels, type conversions with rounding | sequential |
+| native_syntax | real `<<<>>>` syntax, auto-preprocessed | sequential |
