@@ -1,11 +1,10 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
-#include "cuda_sim/cuda_runtime_api.h"
-#include "cuda_sim/runtime.h"
+#include <cuda_runtime.h>
 
 void reduce_launch(const void*, const void*, uint32_t,
-                   cuda_sim::dim3, cuda_sim::dim3);
+                   dim3, dim3);
 
 int main() {
     // Use small N for testing (blockSize threads per block)
@@ -29,7 +28,7 @@ int main() {
     cudaMemcpy(d_input, h_input, N * sizeof(float), cudaMemcpyHostToDevice);
 
     reduce_launch(d_input, d_output, N,
-                  cuda_sim::dim3(numBlocks), cuda_sim::dim3(blockSize));
+                  dim3(numBlocks), dim3(blockSize));
 
     cudaMemcpy(h_output, d_output, numBlocks * sizeof(float), cudaMemcpyDeviceToHost);
 

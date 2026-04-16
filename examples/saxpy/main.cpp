@@ -1,13 +1,12 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
-#include "cuda_sim/cuda_runtime_api.h"
-#include "cuda_sim/runtime.h"
+#include <cuda_runtime.h>
 
 // Use the void* convenience overload for pointer params
 // float param stays as float
 void saxpy_launch(float, const void*, const void*, uint32_t,
-                  cuda_sim::dim3, cuda_sim::dim3);
+                  dim3, dim3);
 
 int main() {
     const int N = 512;
@@ -30,7 +29,7 @@ int main() {
     int numBlocks = (N + blockSize - 1) / blockSize;
 
     saxpy_launch(a, d_x, d_y, N,
-                 cuda_sim::dim3(numBlocks), cuda_sim::dim3(blockSize));
+                 dim3(numBlocks), dim3(blockSize));
 
     cudaMemcpy(h_y, d_y, N * sizeof(float), cudaMemcpyDeviceToHost);
 

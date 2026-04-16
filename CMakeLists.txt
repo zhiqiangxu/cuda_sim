@@ -24,7 +24,9 @@ function(cuda_sim_add_executable TARGET PTX_FILE)
 
     # Build executable from host sources + generated kernel
     add_executable(${TARGET} ${ARGN} ${GENERATED_CPP})
-    target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/include)
+    target_include_directories(${TARGET} PRIVATE
+        ${CMAKE_SOURCE_DIR}/include/compat
+        ${CMAKE_SOURCE_DIR}/include)
 endfunction()
 
 # Examples

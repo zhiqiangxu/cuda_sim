@@ -1,12 +1,11 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
-#include "cuda_sim/cuda_runtime_api.h"
-#include "cuda_sim/runtime.h"
+#include <cuda_runtime.h>
 
 extern "C"
 void histogram_launch(uint64_t, uint64_t, uint32_t,
-                      cuda_sim::dim3, cuda_sim::dim3);
+                      dim3, dim3);
 
 int main() {
     const int N = 1000;
@@ -33,7 +32,7 @@ int main() {
     int numBlocks = (N + blockSize - 1) / blockSize;
 
     histogram_launch((uint64_t)d_data, (uint64_t)d_bins, N,
-                     cuda_sim::dim3(numBlocks), cuda_sim::dim3(blockSize));
+                     dim3(numBlocks), dim3(blockSize));
 
     cudaMemcpy(h_bins, d_bins, NUM_BINS * sizeof(unsigned int), cudaMemcpyDeviceToHost);
 

@@ -1,11 +1,10 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
-#include "cuda_sim/cuda_runtime_api.h"
-#include "cuda_sim/runtime.h"
+#include <cuda_runtime.h>
 
 void matMul_launch(const void*, const void*, const void*, uint32_t,
-                   cuda_sim::dim3, cuda_sim::dim3);
+                   dim3, dim3);
 
 int main() {
     // Small matrix for testing (TILE_SIZE=16, so use 16x16)
@@ -28,8 +27,8 @@ int main() {
     cudaMemcpy(d_B, h_B, N * N * sizeof(float), cudaMemcpyHostToDevice);
 
     // 2D grid: one block of 16x16 threads for a 16x16 matrix
-    cuda_sim::dim3 block(16, 16);
-    cuda_sim::dim3 grid((N + 15) / 16, (N + 15) / 16);
+    dim3 block(16, 16);
+    dim3 grid((N + 15) / 16, (N + 15) / 16);
 
     matMul_launch(d_A, d_B, d_C, N, grid, block);
 

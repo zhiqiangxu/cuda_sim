@@ -1,11 +1,10 @@
 #include <cstdio>
 #include <cstdint>
 #include <cmath>
-#include "cuda_sim/cuda_runtime_api.h"
-#include "cuda_sim/runtime.h"
+#include <cuda_runtime.h>
 
 void warpReduce_launch(const void*, const void*, uint32_t,
-                       cuda_sim::dim3, cuda_sim::dim3);
+                       dim3, dim3);
 
 int main() {
     // 32 elements = 1 warp, simplest test
@@ -31,7 +30,7 @@ int main() {
     cudaMemset(d_output, 0, numBlocks * numWarps * sizeof(float));
 
     warpReduce_launch(d_input, d_output, N,
-                      cuda_sim::dim3(numBlocks), cuda_sim::dim3(blockSize));
+                      dim3(numBlocks), dim3(blockSize));
 
     cudaMemcpy(h_output, d_output, numBlocks * numWarps * sizeof(float),
                cudaMemcpyDeviceToHost);
