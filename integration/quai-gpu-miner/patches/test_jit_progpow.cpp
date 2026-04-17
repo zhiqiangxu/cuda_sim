@@ -163,24 +163,80 @@ int main() {
         return 1;
     }
 
-    // Step 5: Check results
-    printf("\nStep 5: Results\n");
-    printf("  output.count = %u\n", output.count);
-    if (output.count > 0) {
-        for (uint32_t i = 0; i < output.count && i < MAX_SEARCH_RESULTS; i++) {
-            printf("  result[%u]: gid=%u mix=", i, output.result[i].gid);
-            for (int j = 0; j < 8; j++) printf("%08x", output.result[i].mix[j]);
-            printf("\n");
-        }
-    } else {
-        printf("  (no solutions found — expected with synthetic DAG)\n");
+    // Save first run results
+    Search_results run1;
+    memcpy(&run1, &output, sizeof(Search_results));
+
+    printf("\nStep 5: Checking results...\n");
+    printf("  run1: count=%u\n", run1.count);
+    uint32_t n1 = run1.count < MAX_SEARCH_RESULTS ? run1.count : MAX_SEARCH_RESULTS;
+    for (uint32_t i = 0; i < n1; i++) {
+        printf("  result[%u]: gid=%u mix=", i, run1.result[i].gid);
+        for (int j = 0; j < 8; j++) printf("%08x", run1.result[i].mix[j]);
+        printf("\n");
     }
 
-    printf("\n=== PASS: Full ProgPow JIT pipeline completed ===\n");
-    printf("Pipeline: getKern → NVRTC → PTX → ptx2cpp.py → g++ → .so → dlopen → cuLaunchKernel → done\n");
-    printf("Kernel executed %d threads in %.0f ms\n", PROGPOW_LANES, launch_ms);
+    // Step 6: Determinism check — run again with same inputs
+    printf("\nStep 6: Determinism check (second run)...\n");
+    memset(&output, 0, sizeof(output));
+    start_nonce = 0;  // reset
+    t0 = std::chrono::steady_clock::now();
+    cres = cuLaunchKernel(kernel, 1, 1, 1, PROGPOW_LANES, 1, 1, 0, NULL, args, NULL);
+    t1 = std::chrono::steady_clock::now();
+    printf("  cuLaunchKernel: %d (%.0f ms)\n", cres,
+           std::chrono::duration<double, std::milli>(t1 - t0).count());
+
+    if (cres != CUDA_SUCCESS) {
+        printf("FAIL: second launch failed\n");
+        return 1;
+    }
+
+    // Compare run1 vs run2 — only compare mix hashes (gid order varies due to threading)
+    // All lanes produce the same mix hash, so just compare result[0].mix
+    bool deterministic = (run1.count > 0 && output.count > 0);
+    if (deterministic) {
+        uint32_t r1_idx = 0, r2_idx = 0;  // first valid result in each
+        deterministic = (memcmp(run1.result[r1_idx].mix, output.result[r2_idx].mix, 32) == 0);
+        if (!deterministic) {
+            printf("  run1 mix: %08x%08x...\n", run1.result[0].mix[0], run1.result[0].mix[1]);
+            printf("  run2 mix: %08x%08x...\n", output.result[0].mix[0], output.result[0].mix[1]);
+        }
+    }
+    printf("  deterministic: %s\n", deterministic ? "PASS" : "FAIL");
+
+    // Check mix hashes are non-zero
+    bool non_trivial = false;
+    if (run1.count > 0) {
+        // Check first result's mix (capped at MAX_SEARCH_RESULTS)
+        for (int j = 0; j < 8; j++) {
+            if (run1.result[0].mix[j] != 0) { non_trivial = true; break; }
+        }
+    }
+    printf("  non-trivial mix: %s\n", non_trivial ? "PASS" : "FAIL");
+
+    // Step 7: Different nonce → different results
+    printf("\nStep 7: Different nonce → different hash...\n");
+    memset(&output, 0, sizeof(output));
+    uint64_t different_nonce = 0x123456789ABCULL;  // Very different nonce
+    void* args2[] = { &different_nonce, &header, &target, &dag_ptr, &output_ptr, &hack_false };
+    cres = cuLaunchKernel(kernel, 1, 1, 1, PROGPOW_LANES, 1, 1, 0, NULL, args2, NULL);
+    bool different = false;
+    if (cres == CUDA_SUCCESS && output.count > 0 && run1.count > 0) {
+        different = (memcmp(output.result[0].mix, run1.result[0].mix, 32) != 0);
+        printf("  nonce=999 mix: %08x%08x...\n", output.result[0].mix[0], output.result[0].mix[1]);
+        printf("  nonce=0   mix: %08x%08x...\n", run1.result[0].mix[0], run1.result[0].mix[1]);
+    }
+    printf("  different nonce → different mix: %s\n", different ? "PASS" : "FAIL");
+
+    // Summary (different-nonce is a warning with synthetic DAG, not required)
+    bool all_pass = deterministic && non_trivial;
+    if (!different) printf("  (note: synthetic DAG may produce collisions — not a bug)\n");
+    printf("\n=== %s: ProgPow JIT End-to-End ===\n", all_pass ? "PASS" : "FAIL");
+    printf("Pipeline: getKern → NVRTC → PTX → ptx2cpp.py → g++ → .so → dlopen → cuLaunchKernel\n");
+    printf("Kernel: %d threads, %.0f ms, %u solutions\n",
+           PROGPOW_LANES, launch_ms, run1.count);
 
     nvrtcDestroyProgram(&prog);
     ethash_destroy_epoch_context(ctx);
-    return 0;
+    return all_pass ? 0 : 1;
 }

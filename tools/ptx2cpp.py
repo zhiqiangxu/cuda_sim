@@ -158,6 +158,7 @@ PTX_TYPE_TO_CPP = {
 REG_PREFIX_TO_TYPE = {
     "r":  "uint32_t",
     "rd": "uint64_t",
+    "rs": "uint16_t",
     "f":  "float",
     "fd": "double",
     "p":  "bool",
