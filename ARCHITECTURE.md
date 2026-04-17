@@ -214,7 +214,8 @@ cuda_sim/
 ├── CMakeLists.txt
 │
 ├── cmake/
-│   └── CudaSimConfig.cmake     # For external project integration
+│   ├── CudaSimConfig.cmake     # Compile-time PTX integration
+│   └── CudaSimCompile.cmake    # cuda_sim_add_library() — .cu → PTX → C++ pipeline
 │
 ├── docker/
 │   ├── Dockerfile
@@ -226,17 +227,18 @@ cuda_sim/
 │
 ├── include/
 │   ├── compat/                 # Drop-in replacements for CUDA headers
-│   │   ├── cuda_runtime.h
+│   │   ├── cuda_runtime.h      # vector types (uint2/4), device qualifiers, intrinsics
 │   │   ├── cuda_runtime_api.h
 │   │   ├── cuda.h              # includes Driver API (driver_api.h)
-│   │   ├── nvrtc.h             # NVRTC runtime compilation compat
+│   │   ├── nvrtc.h             # NVRTC runtime compilation (nvcc -ptx backend)
+│   │   ├── device_functions.h  # CPU-compatible CUDA intrinsics
 │   │   ├── cuda_fp16.h
 │   │   └── device_launch_parameters.h
 │   └── cuda_sim/
 │       ├── cuda_runtime_api.h  # cudaMalloc/Free/Memcpy + streams + error detection
 │       ├── runtime.h           # dim3
-│       ├── driver_api.h        # CUDA Driver API + JIT engine
-│       ├── device_atomic.h     # atomic_add, atomic_cas, atomic_inc, etc.
+│       ├── driver_api.h        # CUDA Driver API + JIT engine (PTX → .so → dlopen)
+│       ├── device_atomic.h     # atomic_add, atomic_cas, atomic_inc/dec, etc.
 │       ├── barrier.h           # SimpleBarrier for __syncthreads()
 │       └── warp.h              # WarpContext + bit ops (popc, clz, etc.)
 │
@@ -251,6 +253,12 @@ cuda_sim/
 │   ├── relu/                   # 3 kernels, type conversions with rounding
 │   └── native_syntax/          # real <<<>>> syntax, auto-preprocessed
 │
+├── integration/
+│   └── quai-gpu-miner/         # Real-world integration example
+│       ├── Dockerfile           # Docker build (full binary + tests)
+│       ├── build.sh
+│       └── patches/             # CMakeLists, CPU DAG gen, verification tests
+│
 └── tests/
     ├── test_ptx_parser.py      # Parser + translator unit tests
     └── test_error_detection.cpp # Memory error detection tests
@@ -258,21 +266,23 @@ cuda_sim/
 
 ---
 
-## Supported PTX Instructions (56)
+## Supported PTX Instructions (64+)
 
 **Arithmetic**: add, sub, mul, mad, div, rem, fma, abs, neg, min, max, sad
 
-**Bitwise**: and, or, xor, not, shl, shr
+**Bitwise**: and, or, xor, not, shl, shr, shf (funnel shift l/r with wrap/clamp)
 
-**Memory**: ld (param/global/shared), st (global/shared), cvta, prefetch, red
+**Memory**: ld (param/global/shared/const, v4 vector load), st (global/shared/param), cvta, prefetch, red
 
 **Control flow**: mov, setp, selp, slct, bra, ret, exit, bar, trap, brkpt
+
+**Function calls**: .func definitions, call.uni sequences, st.param (return values)
 
 **Type conversion**: cvt (with rounding modes: rn/rz/rm/rp), copysign, prmt
 
 **Math**: sin, cos, sqrt, rsqrt, rcp, lg2, ex2, testp
 
-**Atomics**: atom (add/cas/exch/min/max)
+**Atomics**: atom (add/cas/exch/min/max/inc/dec)
 
 **Warp**: shfl (down/up/idx/xor), vote (ballot/any/all), match (any/all), activemask
 
@@ -338,6 +348,30 @@ extern "C" void* __cuda_sim_get_symbol(const char* name) {
 `cudaMemcpyToSymbol(d_header, &val, size)` → finds address via
 symbol lookup → memcpy.
 
+### PTX .func support (device-side function calls)
+
+Complex kernels (e.g., ProgPow) generate helper functions as PTX `.func` definitions.
+ptx2cpp.py translates these to C++ functions and converts `call.uni` sequences:
+
+```
+PTX:                                C++:
+.func (.param .b64 retval)          static uint64_t keccak_f800(
+  keccak_f800(                          const uint8_t* param_0,
+    .param .align 4 .b8 p0[32],         uint64_t param_1,
+    .param .b64 p1,                      const uint8_t* param_2)
+    .param .align 4 .b8 p2[32])     {
+{ ... st.param [retval], %rd8; }        ... return __func_retval;
+                                    }
+
+{ // callseq                        {
+  .param .align 4 .b8 param0[32];       uint8_t param0[32];
+  st.param [param0+0], %r1;             *(uint32_t*)(param0+0) = r[1];
+  .param .b64 retval0;                  ...
+  call.uni (retval0), keccak_f800;      rd[3] = keccak_f800(param0, ...);
+  ld.param %rd3, [retval0];         }
+}
+```
+
 ### NVRTC flow
 
 ```
@@ -347,6 +381,31 @@ nvrtcGetPTX()               → return generated PTX
 cuModuleLoadDataEx(ptx)     → JIT compile to .so (see above)
 cuLaunchKernel(func, args)  → call generic entry
 ```
+
+---
+
+## Real-World Integration: quai-gpu-miner
+
+cuda_sim has been integrated with [quai-gpu-miner](https://github.com/dominant-strategies/quai-gpu-miner), a ProgPow GPU miner that uses NVRTC + CUDA Driver API.
+
+### What works
+
+- **Full binary compiles** with g++ (no nvcc for host code)
+- **ProgPow JIT kernel** executes end-to-end: `getKern → NVRTC → PTX (56KB, 1116 instructions) → ptx2cpp.py → g++ → .so → cuLaunchKernel`
+- **16 threads** with shared memory (16KB), warp shuffles, barriers
+- **Deterministic results** verified across multiple runs
+- **Non-trivial hash output** (`c2c1b28d0f12ef33...`)
+
+### Integration approach
+
+```
+quai-gpu-miner libethash-cuda/
+├── CUDAMiner.cpp           → compiles directly with cuda_sim compat headers
+├── CUDAMiner_cuda_sim.cpp  → replaces CUDAMiner_cuda.cu (CPU DAG generation)
+└── CUDAMiner_kernel.cu     → embedded as string, compiled by NVRTC at runtime
+```
+
+Docker build: `integration/quai-gpu-miner/Dockerfile`
 
 ---
 

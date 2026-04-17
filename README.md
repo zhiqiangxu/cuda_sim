@@ -2,18 +2,24 @@
 
 [![CI](https://github.com/zhiqiangxu/cuda_sim/actions/workflows/ci.yml/badge.svg)](https://github.com/zhiqiangxu/cuda_sim/actions/workflows/ci.yml)
 
-Run CUDA kernels on CPU without GPU. Translates PTX to C++ at compile time via Docker nvcc.
+Run CUDA kernels on CPU without GPU. Supports both compile-time PTX translation and runtime JIT (NVRTC + Driver API).
 
 ## How it works
 
+**Mode 1: Compile-time** (static kernels)
 ```
-kernel.cu → Docker nvcc -ptx → kernel.ptx → ptx2cpp.py → kernel_cpu.cpp → g++ → CPU binary
-             (generate PTX)                  (translate)                    (compile)
+kernel.cu → nvcc -ptx → kernel.ptx → ptx2cpp.py → kernel_cpu.cpp → g++ → CPU binary
 ```
 
-1. **nvcc** compiles your `.cu` kernel to PTX (CUDA's intermediate representation)
-2. **ptx2cpp.py** translates each PTX instruction to one line of C++
-3. **g++** compiles the generated C++ into a native CPU binary
+**Mode 2: Runtime JIT** (dynamic kernels, e.g. ProgPow mining)
+```
+Program → nvrtcCompileProgram(src) → PTX → cuModuleLoadDataEx → ptx2cpp.py → g++ → .so → dlopen
+       → cuLaunchKernel(func, grid, block, void** args) → execute on CPU
+```
+
+1. **nvcc** compiles `.cu` to PTX (CUDA's intermediate representation)
+2. **ptx2cpp.py** translates each PTX instruction to C++ (64+ instructions supported, including `.func` calls)
+3. **g++** compiles to native binary or shared library
 
 No GPU needed at runtime. nvcc runs inside Docker for cross-platform support.
 
@@ -66,6 +72,16 @@ cuda_sim_add_kernel(my_app kernel.ptx)
 cuda_sim_add_sources(my_app src/main.cpp src/utils.cpp)  # <<<>>> auto-converted
 ```
 
+### Runtime .cu compilation (new)
+
+```cmake
+# cuda_sim_add_library: drop-in replacement for cuda_add_library
+# .cu files → nvcc -ptx → ptx2cpp.py → g++ (automatic)
+set(CUDA_SIM_ROOT /path/to/cuda_sim)
+include(${CUDA_SIM_ROOT}/cmake/CudaSimCompile.cmake)
+cuda_sim_add_library(mylib STATIC kernel.cu host.cpp)
+```
+
 ### Dual GPU/CPU support
 
 ```cmake
@@ -101,7 +117,31 @@ int main() {
 }
 ```
 
-Compat headers intercept `<cuda_runtime.h>`, `<device_launch_parameters.h>`, `<cuda_fp16.h>`, etc.
+Compat headers intercept `<cuda_runtime.h>`, `<cuda.h>`, `<nvrtc.h>`, `<device_launch_parameters.h>`, `<cuda_fp16.h>`, etc.
+
+## Runtime JIT (CUDA Driver API + NVRTC)
+
+For projects that compile kernels at runtime (e.g., GPU miners):
+
+```cpp
+#include <nvrtc.h>
+#include <cuda.h>
+
+// Compile kernel source to PTX
+nvrtcCreateProgram(&prog, kernel_src, "kernel.cu", 0, NULL, NULL);
+nvrtcCompileProgram(prog, num_opts, opts);  // calls nvcc -ptx
+nvrtcGetPTX(prog, ptx);
+
+// Load PTX module (JIT: ptx2cpp.py → g++ → .so → dlopen)
+cuModuleLoadDataEx(&module, ptx, 0, NULL, NULL);
+cuModuleGetFunction(&func, module, "my_kernel");
+
+// Launch with void** args (type-safe unpacking via _launch_generic)
+void* args[] = {&nonce, &header, &target, &dag_ptr, &output_ptr};
+cuLaunchKernel(func, gridX, 1, 1, blockX, 1, 1, 0, stream, args, NULL);
+```
+
+Verified with quai-gpu-miner's ProgPow kernel: 56KB PTX, 1116 instructions, `.func` calls, shared memory, warp shuffles.
 
 ## Examples
 
@@ -119,21 +159,23 @@ Compat headers intercept `<cuda_runtime.h>`, `<device_launch_parameters.h>`, `<c
 
 All examples verified with real nvcc-generated PTX (CUDA 12.6).
 
-## Supported PTX instructions (56)
+## Supported PTX instructions (64+)
 
 **Arithmetic**: add, sub, mul, mad, div, rem, fma, abs, neg, min, max, sad
 
-**Bitwise**: and, or, xor, not, shl, shr
+**Bitwise**: and, or, xor, not, shl, shr, shf (funnel shift l/r with wrap/clamp)
 
-**Memory**: ld (param/global/shared), st (global/shared), cvta, prefetch, red
+**Memory**: ld (param/global/shared/const, v4 vector), st (global/shared/param), cvta, prefetch, red
 
 **Control flow**: mov, setp, selp, slct, bra, ret, exit, bar, trap, brkpt
+
+**Function calls**: .func definitions, call.uni sequences, struct params, return values
 
 **Type conversion**: cvt (with rounding modes: rn/rz/rm/rp), copysign, prmt
 
 **Math**: sin, cos, sqrt, rsqrt, rcp, lg2, ex2, testp
 
-**Atomics**: atom (add/cas/exch/min/max)
+**Atomics**: atom (add/cas/exch/min/max/inc/dec)
 
 **Warp**: shfl (down/up/idx/xor), vote (ballot/any/all), match (any/all), activemask
 
@@ -154,6 +196,18 @@ Built-in runtime checks — always active, no flags needed:
 ```
 
 Detects: memory leaks, double free, invalid free, buffer overflow, buffer underflow, use-after-free (poisoned memory).
+
+## Real-world integration: quai-gpu-miner
+
+cuda_sim has been integrated with [quai-gpu-miner](https://github.com/dominant-strategies/quai-gpu-miner) — a ProgPow GPU miner using NVRTC + CUDA Driver API.
+
+```bash
+# Build in Docker (includes CUDA toolkit for NVRTC)
+cd cuda_sim
+./integration/quai-gpu-miner/build.sh
+```
+
+**Verified**: full binary compiles, ProgPow JIT kernel executes with 16 threads, shared memory, warp shuffles, deterministic hash output.
 
 ## Requirements
 
