@@ -232,6 +232,167 @@ def test_translate_cvta():
     print("PASS: test_translate_cvta")
 
 
+def test_translate_mov_b64():
+    """Test mov.b64 split and merge — the bug that caused ProgPow nonce insensitivity."""
+    ptx = """
+.visible .entry foo(
+    .param .u64 foo_param_0
+) {
+    .reg .b32  %r<4>;
+    .reg .b64  %rd<3>;
+    ld.param.u64    %rd0, [foo_param_0];
+    mov.b64 {%r0, %r1}, %rd0;
+    mov.b64 %rd1, {%r2, %r3};
+    ret;
+}
+"""
+    kernels = PTXParser(ptx).parse()
+    t = PTXTranslator(kernels[0])
+    lines = t.translate_all()
+
+    # Split: rd → {lo, hi}
+    split_line = lines[1]
+    assert "(uint32_t)(rd[0])" in split_line and ">> 32" in split_line, \
+        f"mov.b64 split failed: {split_line}"
+
+    # Merge: {lo, hi} → rd
+    merge_line = lines[2]
+    assert "rd[1]" in merge_line and "<< 32" in merge_line and "r[2]" in merge_line, \
+        f"mov.b64 merge failed: {merge_line}"
+
+    print("PASS: test_translate_mov_b64")
+
+
+def test_translate_shf():
+    """Test funnel shift (shf.l/r.wrap.b32) — used heavily in ProgPow keccak."""
+    ptx = """
+.visible .entry foo(
+    .param .u64 foo_param_0
+) {
+    .reg .b32  %r<6>;
+    shf.l.wrap.b32 %r0, %r1, %r2, %r3;
+    shf.r.wrap.b32 %r4, %r1, %r2, %r5;
+    ret;
+}
+"""
+    kernels = PTXParser(ptx).parse()
+    t = PTXTranslator(kernels[0])
+    lines = t.translate_all()
+
+    # Left shift should use <<
+    assert "<<" in lines[0] and ">>" in lines[0], f"shf.l failed: {lines[0]}"
+    # Right shift
+    assert ">>" in lines[1], f"shf.r failed: {lines[1]}"
+
+    print("PASS: test_translate_shf")
+
+
+def test_translate_v4_load():
+    """Test vector load ld.global.v4.u32 — used for DAG access in ProgPow."""
+    ptx = """
+.visible .entry foo(
+    .param .u64 foo_param_0
+) {
+    .reg .b32  %r<5>;
+    .reg .b64  %rd<2>;
+    ld.param.u64        %rd0, [foo_param_0];
+    ld.global.v4.u32    {%r0, %r1, %r2, %r3}, [%rd0];
+    ret;
+}
+"""
+    kernels = PTXParser(ptx).parse()
+    t = PTXTranslator(kernels[0])
+    lines = t.translate_all()
+
+    v4_line = lines[1]
+    assert "r[0]" in v4_line and "r[1]" in v4_line and "r[2]" in v4_line and "r[3]" in v4_line, \
+        f"v4 load failed: {v4_line}"
+    assert "[0]" in v4_line and "[1]" in v4_line and "[2]" in v4_line and "[3]" in v4_line, \
+        f"v4 load missing indices: {v4_line}"
+
+    print("PASS: test_translate_v4_load")
+
+
+def test_translate_func():
+    """Test .func parsing and call sequence translation."""
+    ptx = """
+.func (.param .b64 func_retval0) helper(
+    .param .b64 helper_param_0,
+    .param .b32 helper_param_1
+)
+{
+    .reg .b32  %r<2>;
+    .reg .b64  %rd<2>;
+    ld.param.u64 %rd0, [helper_param_0];
+    ld.param.u32 %r0, [helper_param_1];
+    add.u64      %rd1, %rd0, 1;
+    st.param.b64 [func_retval0+0], %rd1;
+    ret;
+}
+
+.visible .entry foo(
+    .param .u64 foo_param_0
+) {
+    .reg .b64  %rd<3>;
+    ld.param.u64 %rd0, [foo_param_0];
+    { // callseq 0, 0
+    .reg .b32 temp_param_reg;
+    .param .b64 param0;
+    st.param.b64 [param0+0], %rd0;
+    .param .b32 param1;
+    st.param.b32 [param1+0], 42;
+    .param .b64 retval0;
+    call.uni (retval0),
+    helper,
+    (
+    param0,
+    param1
+    );
+    ld.param.b64 %rd1, [retval0+0];
+    } // callseq 0
+    ret;
+}
+"""
+    parser = PTXParser(ptx)
+    kernels = parser.parse()
+
+    assert len(parser.func_defs) == 1, "Should parse 1 .func"
+    assert parser.func_defs[0].name == "helper"
+    assert parser.func_defs[0].ret_type == "b64"
+
+    assert len(kernels) == 1, "Should parse 1 .entry"
+
+    # Check that callseq is translated
+    t = PTXTranslator(kernels[0])
+    lines = t.translate_all()
+    callseq_text = "\n".join(lines)
+    assert "helper(" in callseq_text, f"Call to helper not found in: {callseq_text}"
+    assert "rd[1]" in callseq_text, f"Return value not captured: {callseq_text}"
+
+    print("PASS: test_translate_func")
+
+
+def test_translate_atom_inc():
+    """Test atom.global.inc — used for output buffer counting in ProgPow."""
+    ptx = """
+.visible .entry foo(
+    .param .u64 foo_param_0
+) {
+    .reg .b32  %r<2>;
+    .reg .b64  %rd<2>;
+    ld.param.u64      %rd0, [foo_param_0];
+    atom.global.inc.u32 %r0, [%rd0], -1;
+    ret;
+}
+"""
+    kernels = PTXParser(ptx).parse()
+    t = PTXTranslator(kernels[0])
+    lines = t.translate_all()
+
+    assert "atomic_inc" in lines[1], f"atom.inc failed: {lines[1]}"
+    print("PASS: test_translate_atom_inc")
+
+
 def test_generate_launch_wrapper():
     ptx = """
 .visible .entry myKernel(
@@ -336,6 +497,11 @@ if __name__ == "__main__":
     test_translate_branch()
     test_translate_special_regs()
     test_translate_cvta()
+    test_translate_mov_b64()
+    test_translate_shf()
+    test_translate_v4_load()
+    test_translate_func()
+    test_translate_atom_inc()
     test_generate_launch_wrapper()
     test_end_to_end_compile()
     test_end_to_end_run()
