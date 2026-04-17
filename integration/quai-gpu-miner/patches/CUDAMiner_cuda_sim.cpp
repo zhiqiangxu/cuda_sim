@@ -11,6 +11,8 @@
  */
 
 #include "CUDAMiner_cuda.h"
+#include <thread>
+#include <vector>
 
 #define ETHASH_HASH_BYTES 64
 #define ETHASH_DATASET_PARENTS 512
@@ -145,15 +147,29 @@ void ethash_generate_dag(
 {
     (void)stream; (void)device;
     uint64_t const work = dag_bytes / sizeof(hash64_t);
-    uint32_t batch = blocks * threads;
-    uint32_t fullRuns = (uint32_t)(work / batch);
-    uint32_t restWork = (uint32_t)(work % batch);
-    if (restWork > 0) fullRuns++;
 
-    for (uint32_t i = 0; i < fullRuns; i++) {
-        ethash_calculate_dag_item_cpu(
-            i * batch, dag, dag_bytes, light, light_words, batch);
+    // Multi-threaded DAG generation using std::thread
+    unsigned hw_threads = std::thread::hardware_concurrency();
+    if (hw_threads == 0) hw_threads = 4;
+    unsigned num_workers = hw_threads;
+
+    uint64_t items_per_worker = (work + num_workers - 1) / num_workers;
+    std::vector<std::thread> workers;
+    workers.reserve(num_workers);
+
+    for (unsigned w = 0; w < num_workers; w++) {
+        uint64_t start = w * items_per_worker;
+        uint64_t count = items_per_worker;
+        if (start + count > work) count = (start < work) ? work - start : 0;
+        if (count == 0) break;
+
+        workers.emplace_back([=]() {
+            ethash_calculate_dag_item_cpu(
+                (uint32_t)start, dag, dag_bytes, light, light_words, (uint32_t)count);
+        });
     }
+
+    for (auto& t : workers) t.join();
 }
 
 void set_constants(hash64_t* _dag, uint32_t _dag_size, hash64_t* _light, uint32_t _light_size) {
