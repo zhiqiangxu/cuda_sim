@@ -41,6 +41,8 @@ class Param:
     struct_align: int = 0     # alignment for struct params
 
     def cpp_type(self) -> str:
+        if self.is_struct:
+            return "uint64_t"  # Struct params are passed as pointer (address)
         return PTX_TYPE_TO_CPP.get(self.ptx_type, "uint64_t")
 
 
@@ -80,6 +82,40 @@ class ConstDecl:
     name: str
     size: int       # total bytes
     align: int      # alignment
+    init_data: str = ""  # initialization data (e.g. "1, 0, 0, ...")
+
+
+@dataclass
+class CallSeqParam:
+    """A parameter in a call sequence."""
+    name: str           # local param name (param0, param1, ...)
+    ptx_type: str       # b32, b64, etc.
+    is_struct: bool = False
+    struct_size: int = 0
+    struct_align: int = 0
+    stores: list = field(default_factory=list)  # (offset, value_expr) pairs
+
+
+@dataclass
+class CallSeq:
+    """A parsed call sequence { // callseq ... }."""
+    func_name: str                     # target function name
+    params: list[CallSeqParam] = field(default_factory=list)
+    retval_type: str = ""              # return value PTX type (e.g. "b64")
+    retval_name: str = ""              # e.g. "retval0"
+    result_reg: str = ""               # register to store result (e.g. "%rd3")
+
+
+@dataclass
+class FuncDef:
+    """A parsed PTX device function (.func)."""
+    name: str
+    params: list[Param]
+    ret_type: str = ""        # return value PTX type (e.g. "b64"), empty if void
+    ret_name: str = ""        # return value param name (e.g. "func_retval0")
+    registers: dict[str, int] = field(default_factory=dict)
+    instructions: list[Instruction] = field(default_factory=list)
+    labels: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -147,6 +183,7 @@ class PTXParser:
         self.lines = text.splitlines()
         self.pos = 0
         self.const_decls: list[ConstDecl] = []
+        self.func_defs: list[FuncDef] = []
 
     def parse(self) -> list[KernelDef]:
         kernels = []
@@ -154,10 +191,12 @@ class PTXParser:
             line = self._current_line()
             if ".entry" in line:
                 kernels.append(self._parse_kernel())
+            elif ".func" in line and "call" not in line:
+                self.func_defs.append(self._parse_func())
             else:
                 # Parse .const declarations (module-level)
                 const_match = re.match(
-                    r'\.(?:visible\s+)?\.const\s+(?:\.align\s+(\d+)\s+)?\.(\w+)\s+(\w+)\[(\d+)\]',
+                    r'(?:\.visible\s+)?\.const\s+(?:\.align\s+(\d+)\s+)?\.(\w+)\s+(\w+)\[(\d+)\]',
                     line)
                 if const_match:
                     align = int(const_match.group(1)) if const_match.group(1) else 4
@@ -169,7 +208,12 @@ class PTXParser:
                                   "s8": 1, "s16": 2, "s32": 4, "s64": 8,
                                   "f32": 4, "f64": 8}
                     elem_size = type_sizes.get(elem_type, 1)
-                    self.const_decls.append(ConstDecl(cname, elem_size * count, align))
+                    # Check for initialization data: = {1, 2, 3, ...}
+                    init_data = ""
+                    init_match = re.search(r'=\s*\{([^}]+)\}', line)
+                    if init_match:
+                        init_data = init_match.group(1).strip()
+                    self.const_decls.append(ConstDecl(cname, elem_size * count, align, init_data))
                 self.pos += 1
         return kernels
 
@@ -219,9 +263,24 @@ class PTXParser:
             line = self._current_line()
             self.pos += 1
 
-            if line == "}" or line.startswith("}"):
+            if line == "}" or (line.startswith("}") and "callseq" not in line):
                 break
-            if not line or line.startswith("//"):
+            if not line or line.startswith("//") or line.startswith(".pragma"):
+                continue
+
+            # Call sequence block: { // callseq N, M
+            if line.startswith("{") and "callseq" in line:
+                self.pos -= 1  # un-consume, _parse_callseq expects to see it
+                callseq = self._parse_callseq()
+                # Emit as a pseudo-instruction
+                inst = Instruction(
+                    predicate=None, pred_negate=False,
+                    opcode="__callseq__", modifiers=[],
+                    operands=[],
+                    source_line=self.pos
+                )
+                inst._callseq = callseq  # attach parsed data
+                instructions.append(inst)
                 continue
 
             # Register declarations: .reg .f32 %f<4>;
@@ -298,6 +357,173 @@ class PTXParser:
                          shared_decls=shared_decls, uses_shared_memory=uses_shared,
                          has_dynamic_shared=has_dynamic, uses_warp=uses_warp)
 
+    def _parse_func(self) -> FuncDef:
+        """Parse a .func definition (device-side helper function)."""
+        # Parse return type: .func (.param .b64 func_retval0) name(
+        # or: .func name(
+        line = self._current_line()
+        ret_type = ""
+        ret_name = ""
+        ret_match = re.search(r'\.func\s+\(\.param\s+\.(\w+)\s+(\w+)\)\s+(\w+)', line)
+        if ret_match:
+            ret_type = ret_match.group(1)
+            ret_name = ret_match.group(2)
+            name = ret_match.group(3)
+        else:
+            name_match = re.search(r'\.func\s+(\w+)', line)
+            name = name_match.group(1) if name_match else "unknown_func"
+        self.pos += 1
+
+        # Parse parameters (same as kernel)
+        params = []
+        while self.pos < len(self.lines):
+            line = self._current_line()
+            if "{" in line:
+                self.pos += 1
+                break
+            # Struct parameter
+            struct_param_match = re.search(
+                r'\.param\s+\.align\s+(\d+)\s+\.b8\s+(\w+)\[(\d+)\]', line)
+            if struct_param_match:
+                align = int(struct_param_match.group(1))
+                pname = struct_param_match.group(2)
+                size = int(struct_param_match.group(3))
+                params.append(Param(name=pname, ptx_type="b8",
+                                    is_struct=True, struct_size=size,
+                                    struct_align=align))
+                self.pos += 1
+                continue
+            param_match = re.search(r'\.param\s+\.(\w+)\s+(\w+)', line)
+            if param_match:
+                params.append(Param(name=param_match.group(2),
+                                    ptx_type=param_match.group(1)))
+            self.pos += 1
+
+        # Parse body (registers + instructions)
+        registers: dict[str, int] = {}
+        instructions: list[Instruction] = []
+        labels: set[str] = set()
+
+        while self.pos < len(self.lines):
+            line = self._current_line()
+            self.pos += 1
+            if line == "}" or line.startswith("}"):
+                break
+            if not line or line.startswith("//") or line.startswith(".pragma"):
+                continue
+
+            # Register declarations
+            reg_match = re.match(r'\.reg\s+\.(\w+)\s+%(\w+)<(\d+)>', line)
+            if reg_match:
+                prefix = reg_match.group(2)
+                count = int(reg_match.group(3))
+                registers[prefix] = count
+                continue
+
+            # Labels
+            label_match = re.match(r'(\$?\w+):', line)
+            if label_match:
+                label_name = label_match.group(1)
+                labels.add(label_name)
+                inst = Instruction(predicate=None, pred_negate=False,
+                                   opcode="__label__", modifiers=[],
+                                   operands=[label_name], source_line=self.pos)
+                instructions.append(inst)
+                continue
+
+            # Instructions
+            inst = self._parse_instruction(line)
+            if inst:
+                inst.source_line = self.pos
+                instructions.append(inst)
+
+        return FuncDef(name=name, params=params, ret_type=ret_type,
+                       ret_name=ret_name, registers=registers,
+                       instructions=instructions, labels=labels)
+
+    def _parse_callseq(self) -> CallSeq:
+        """Parse a { // callseq ... } block into a CallSeq object."""
+        self.pos += 1  # skip the opening { // callseq line
+        params: list[CallSeqParam] = []
+        retval_type = ""
+        retval_name = ""
+        func_name = ""
+        result_reg = ""
+        current_param: CallSeqParam | None = None
+
+        while self.pos < len(self.lines):
+            line = self._current_line()
+            self.pos += 1
+
+            if line.startswith("}"):
+                break
+            if not line or line.startswith("//") or ".reg " in line:
+                continue
+
+            # Local struct param: .param .align 4 .b8 param0[32]
+            struct_match = re.match(
+                r'\.param\s+\.align\s+(\d+)\s+\.b8\s+(\w+)\[(\d+)\]', line)
+            if struct_match:
+                align = int(struct_match.group(1))
+                pname = struct_match.group(2)
+                size = int(struct_match.group(3))
+                current_param = CallSeqParam(
+                    name=pname, ptx_type="b8",
+                    is_struct=True, struct_size=size, struct_align=align)
+                params.append(current_param)
+                continue
+
+            # Local scalar param: .param .b64 param1
+            scalar_match = re.match(r'\.param\s+\.(\w+)\s+(\w+)', line)
+            if scalar_match:
+                ptype = scalar_match.group(1)
+                pname = scalar_match.group(2)
+                if pname.startswith("retval"):
+                    retval_type = ptype
+                    retval_name = pname
+                else:
+                    current_param = CallSeqParam(name=pname, ptx_type=ptype)
+                    params.append(current_param)
+                continue
+
+            # st.param: write to a call parameter
+            st_match = re.match(
+                r'st\.param\.(\w+)\s+\[(\w+)\+(\d+)\],\s*(.+)', line.rstrip(";"))
+            if st_match:
+                pname = st_match.group(2)
+                offset = int(st_match.group(3))
+                value = st_match.group(4).strip()
+                for p in params:
+                    if p.name == pname:
+                        p.stores.append((offset, value))
+                        break
+                continue
+
+            # call.uni (retval0), func_name, (param0, param1, ...)
+            if "call" in line:
+                # The call may span multiple lines
+                call_text = line
+                while ");" not in call_text and self.pos < len(self.lines):
+                    call_text += " " + self._current_line()
+                    self.pos += 1
+                name_match = re.search(r'call\S*\s+\((\w+)\),\s*(\w+)', call_text)
+                if name_match:
+                    retval_name = name_match.group(1)
+                    func_name = name_match.group(2)
+                continue
+
+            # ld.param: read return value
+            ld_match = re.match(
+                r'ld\.param\.(\w+)\s+(%\w+),\s*\[(\w+)\+\d+\]', line.rstrip(";"))
+            if ld_match:
+                if ld_match.group(3) == retval_name:
+                    result_reg = ld_match.group(2)
+                continue
+
+        return CallSeq(func_name=func_name, params=params,
+                       retval_type=retval_type, retval_name=retval_name,
+                       result_reg=result_reg)
+
     def _parse_instruction(self, line: str) -> Instruction | None:
         line = line.rstrip(";").strip()
         if not line:
@@ -331,10 +557,11 @@ class PTXParser:
                            operands=operands)
 
     def _parse_operands(self, text: str) -> list[str]:
-        """Parse operands handling [addr+offset] brackets and dst|pred pipes."""
+        """Parse operands handling [addr+offset] brackets, {multi-reg} and dst|pred pipes."""
         operands = []
         current = ""
-        bracket_depth = 0
+        bracket_depth = 0  # [ ] depth
+        brace_depth = 0    # { } depth
 
         for ch in text:
             if ch == "[":
@@ -343,7 +570,11 @@ class PTXParser:
             elif ch == "]":
                 bracket_depth -= 1
                 current += ch
-            elif ch == "," and bracket_depth == 0:
+            elif ch == "{":
+                brace_depth += 1
+            elif ch == "}":
+                brace_depth -= 1
+            elif ch == "," and bracket_depth == 0 and brace_depth == 0:
                 operands.append(current.strip())
                 current = ""
             else:
@@ -352,10 +583,13 @@ class PTXParser:
         if current.strip():
             operands.append(current.strip())
 
-        # Expand pipe-separated operands: %r11|%p2 → ["%r11", "%p2"]
+        # Expand multi-register operands from {%r1, %r2, %r3} groups
         expanded = []
         for op in operands:
-            if "|" in op and not op.startswith("["):
+            if "," in op and "%" in op and "[" not in op:
+                # This is a multi-register group like "%r194, %r195, %r196, %r197"
+                expanded.extend(p.strip() for p in op.split(","))
+            elif "|" in op and not op.startswith("["):
                 expanded.extend(p.strip() for p in op.split("|"))
             else:
                 expanded.append(op)
@@ -369,7 +603,7 @@ class PTXParser:
 class PTXTranslator:
     """Translates parsed PTX instructions into C++ statements."""
 
-    def __init__(self, kernel: KernelDef):
+    def __init__(self, kernel: KernelDef, const_names: set[str] | None = None):
         self.kernel = kernel
         self.diagnostics: list[Diagnostic] = []
         self.param_map: dict[str, str] = {}  # PTX param name -> C++ param name
@@ -379,6 +613,8 @@ class PTXTranslator:
         self.shared_map: dict[str, int] = {}
         for sd in kernel.shared_decls:
             self.shared_map[sd.name] = sd.offset
+        # .const variable names (for address resolution)
+        self.const_names: set[str] = const_names or set()
 
     def translate_all(self) -> list[str]:
         """Translate all instructions to C++ lines."""
@@ -444,6 +680,10 @@ class PTXTranslator:
             float_val = struct.unpack('f', struct.pack('I', hex_val))[0]
             return f"{float_val}f"
 
+        # .const variable: return address as uint64_t
+        if op in self.const_names:
+            return f"(uint64_t)(uintptr_t){op}"
+
         # Label
         if op.startswith("$") or op.startswith("L_") or op.startswith("BB"):
             return self._label_to_cpp(op)
@@ -470,11 +710,54 @@ class PTXTranslator:
         cpp_type = PTX_TYPE_TO_CPP.get(type_mod, "uint32_t")
         return cpp_type
 
+    def _translate_callseq(self, cs: CallSeq) -> str:
+        """Translate a CallSeq into C++ function call."""
+        lines = []
+        lines.append("{ /* callseq */")
+
+        # Declare and fill parameters
+        call_args = []
+        for p in cs.params:
+            if p.is_struct:
+                lines.append(f"    uint8_t {p.name}[{p.struct_size}] = {{}};")
+                for offset, value in p.stores:
+                    cpp_val = self._operand_to_cpp(value)
+                    # Determine type from offset stride
+                    lines.append(f"    *(uint32_t*)({p.name}+{offset}) = {cpp_val};")
+                call_args.append(p.name)
+            else:
+                cpp_type = PTX_TYPE_TO_CPP.get(p.ptx_type, "uint64_t")
+                if p.stores:
+                    _, value = p.stores[0]
+                    cpp_val = self._operand_to_cpp(value)
+                    lines.append(f"    {cpp_type} {p.name} = {cpp_val};")
+                else:
+                    lines.append(f"    {cpp_type} {p.name} = 0;")
+                call_args.append(p.name)
+
+        # Generate the call
+        ret_type = PTX_TYPE_TO_CPP.get(cs.retval_type, "uint64_t") if cs.retval_type else "void"
+        args_str = ", ".join(call_args)
+        if cs.retval_type and cs.result_reg:
+            result_cpp = self._operand_to_cpp(cs.result_reg)
+            lines.append(f"    {result_cpp} = ({ret_type}){cs.func_name}({args_str});")
+        elif cs.retval_type:
+            lines.append(f"    {cs.func_name}({args_str});")
+        else:
+            lines.append(f"    {cs.func_name}({args_str});")
+
+        lines.append("}")
+        return "\n    ".join(lines)
+
     def _translate_one(self, inst: Instruction) -> str | None:
         """Translate a single instruction to C++."""
         op = inst.opcode
         mods = inst.modifiers
         operands = inst.operands
+
+        # Call sequence pseudo-instruction
+        if op == "__callseq__":
+            return self._translate_callseq(inst._callseq)
 
         # Label pseudo-instruction
         if op == "__label__":
@@ -600,8 +883,31 @@ class PTXTranslator:
 
         # --- Load / Store ---
         if op == "ld":
+            # Vector load: ld.global.v4.u32 {%r1,%r2,%r3,%r4}, [addr]
+            if any(m.startswith("v") and m[1:].isdigit() for m in mods):
+                vec_size = 0
+                for m in mods:
+                    if m.startswith("v") and m[1:].isdigit():
+                        vec_size = int(m[1:])
+                        break
+                ptr_type = self._ptr_type(type_mod) if type_mod else "uint32_t"
+                # ops[0] to ops[vec_size-1] are the destination registers
+                # ops[vec_size] is the address
+                addr = ops[vec_size]
+                lines = []
+                for i in range(vec_size):
+                    lines.append(f"{ops[i]} = (({ptr_type}*)({addr}))[{i}];")
+                return " ".join(lines)
+
             # ld.param.u64, ld.global.f32, ld.shared.f32, etc.
             if "param" in mods:
+                # Check if this is loading from a struct param
+                # For struct params: param_i is uint64_t (address in .entry)
+                #                    or const uint8_t* (in .func)
+                for p_idx, p in enumerate(self.kernel.params):
+                    if p.is_struct and f"param_{p_idx}" in str(ops[1]):
+                        ptr_type = self._ptr_type(type_mod) if type_mod else "uint32_t"
+                        return f"{ops[0]} = *({ptr_type}*)((uint8_t*)(uintptr_t){ops[1]});"
                 return f"{ops[0]} = {ops[1]};"
             ptr_type = self._ptr_type(type_mod) if type_mod else "uint32_t"
             if "shared" in mods:
@@ -613,11 +919,14 @@ class PTXTranslator:
                 else:
                     # Register holding offset
                     return f"{ops[0]} = *({ptr_type}*)(__shared_mem + (uint32_t)({addr}));"
-            # Global memory load
+            # Global/const memory load
             return f"{ops[0]} = *({ptr_type}*)({ops[1]});"
 
         if op == "st":
             ptr_type = self._ptr_type(type_mod) if type_mod else "uint32_t"
+            if "param" in mods:
+                # st.param inside .func body → set return value
+                return f"__func_retval = ({ptr_type}){ops[1]};"
             if "shared" in mods:
                 addr = ops[0]
                 if "__shared_mem" in addr:
@@ -739,6 +1048,10 @@ class PTXTranslator:
                 return f"{ops[0]} = cuda_sim::atomic_min(({ptr_type}*)({ops[1]}), ({ptr_type}){ops[2]});"
             if atom_op == "max":
                 return f"{ops[0]} = cuda_sim::atomic_max(({ptr_type}*)({ops[1]}), ({ptr_type}){ops[2]});"
+            if atom_op == "inc":
+                return f"{ops[0]} = cuda_sim::atomic_inc((uint32_t*)({ops[1]}), (uint32_t){ops[2]});"
+            if atom_op == "dec":
+                return f"{ops[0]} = cuda_sim::atomic_dec((uint32_t*)({ops[1]}), (uint32_t){ops[2]});"
             return None
 
         # --- Barrier ---
@@ -917,6 +1230,22 @@ class PTXTranslator:
         if op == "isspacep":
             return f"{ops[0]} = true; /* address space check — trivially true on CPU */;"
 
+        # --- Funnel shift ---
+        if op == "shf":
+            # shf.l.wrap.b32 %dst, %lo, %hi, %shift → funnel shift left (rotate)
+            # shf.r.wrap.b32 %dst, %lo, %hi, %shift → funnel shift right
+            direction = "l" if "l" in mods else "r"
+            if "wrap" in mods:
+                # When lo == hi, this is rotation
+                if direction == "l":
+                    return f"{ops[0]} = ({ops[1]} << ({ops[3]} & 31)) | ({ops[2]} >> (32 - ({ops[3]} & 31)));"
+                else:
+                    return f"{ops[0]} = ({ops[1]} >> ({ops[3]} & 31)) | ({ops[2]} << (32 - ({ops[3]} & 31)));"
+            # clamp mode (non-wrap)
+            if direction == "l":
+                return f"{ops[0]} = (((uint64_t){ops[2]} << 32) | {ops[1]}) << ({ops[3]} & 31) >> 32;"
+            return f"{ops[0]} = (uint32_t)(((uint64_t){ops[2]} << 32) | {ops[1]}) >> ({ops[3]} & 31);"
+
         # --- No-op ---
         if op in ("nop", "membar", "fence"):
             return "/* memory fence — no-op in sequential mode */;"
@@ -928,8 +1257,66 @@ class PTXTranslator:
 # Code generator
 # ---------------------------------------------------------------------------
 
+def _generate_func(func: FuncDef, const_names: set[str] | None = None) -> tuple[list[str], list[Diagnostic]]:
+    """Generate C++ code for a .func definition."""
+    lines = []
+    diagnostics = []
+
+    # Create a KernelDef-like wrapper to reuse PTXTranslator
+    dummy_kernel = KernelDef(
+        name=func.name, params=func.params,
+        registers=func.registers, instructions=func.instructions,
+        labels=func.labels)
+    translator = PTXTranslator(dummy_kernel, const_names)
+    cpp_lines = translator.translate_all()
+    diagnostics.extend(translator.diagnostics)
+
+    # Return type
+    if func.ret_type:
+        ret_cpp = PTX_TYPE_TO_CPP.get(func.ret_type, "uint64_t")
+    else:
+        ret_cpp = "void"
+
+    # Parameter declarations
+    param_decls = []
+    for i, p in enumerate(func.params):
+        if p.is_struct:
+            param_decls.append(f"const uint8_t* param_{i}")
+        else:
+            param_decls.append(f"{p.cpp_type()} param_{i}")
+
+    lines.append(f"static {ret_cpp} {func.name}(")
+    lines.append(f"    {', '.join(param_decls)})")
+    lines.append("{")
+
+    # Return value variable
+    if func.ret_type:
+        lines.append(f"    {ret_cpp} __func_retval = 0;")
+
+    # Register declarations
+    for prefix, count in sorted(func.registers.items()):
+        cpp_type = REG_PREFIX_TO_TYPE.get(prefix, "uint32_t")
+        lines.append(f"    {cpp_type} {prefix}[{count}] = {{}};")
+    if func.registers:
+        lines.append("")
+
+    # Translated instructions
+    for cpp_line in cpp_lines:
+        if cpp_line.endswith(":;"):
+            lines.append(cpp_line)
+        elif cpp_line.strip() == "return;" and func.ret_type:
+            lines.append(f"    return __func_retval;")
+        else:
+            lines.append(f"    {cpp_line}")
+    lines.append("}")
+    lines.append("")
+
+    return lines, diagnostics
+
+
 def generate_cpp(kernels: list[KernelDef],
-                  const_decls: list[ConstDecl] | None = None) -> tuple[str, list[Diagnostic]]:
+                  const_decls: list[ConstDecl] | None = None,
+                  func_defs: list[FuncDef] | None = None) -> tuple[str, list[Diagnostic]]:
     """Generate complete C++ file from translated kernels.
     Returns (cpp_code, diagnostics)."""
     all_diagnostics: list[Diagnostic] = []
@@ -951,8 +1338,28 @@ def generate_cpp(kernels: list[KernelDef],
     lines.append('#include "cuda_sim/warp.h"')
     lines.append("")
 
+    # Generate __constant__ / .const variables (must come before functions that reference them)
+    if const_decls:
+        lines.append("// --- __constant__ / .const variables ---")
+        for cd in const_decls:
+            if cd.init_data:
+                lines.append(f"alignas({cd.align}) static uint8_t {cd.name}[{cd.size}] = {{{cd.init_data}}};")
+            else:
+                lines.append(f"alignas({cd.align}) static uint8_t {cd.name}[{cd.size}];")
+        lines.append("")
+
+    # Collect const names for operand resolution
+    const_name_set = {cd.name for cd in const_decls} if const_decls else set()
+
+    # Generate .func definitions (must come before kernels that call them)
+    if func_defs:
+        for func in func_defs:
+            func_lines, func_diags = _generate_func(func, const_name_set)
+            lines.extend(func_lines)
+            all_diagnostics.extend(func_diags)
+
     for kernel in kernels:
-        translator = PTXTranslator(kernel)
+        translator = PTXTranslator(kernel, const_name_set)
         cpp_lines = translator.translate_all()
         all_diagnostics.extend(translator.diagnostics)
         num_instructions = len([i for i in kernel.instructions if i.opcode != "__label__"])
@@ -1148,13 +1555,8 @@ def generate_cpp(kernels: list[KernelDef],
         lines.append("}")
         lines.append("")
 
-    # --- __constant__ variable globals and symbol lookup ---
+    # --- __constant__ symbol lookup function ---
     if const_decls:
-        lines.append("// --- __constant__ variables ---")
-        for cd in const_decls:
-            lines.append(f"alignas({cd.align}) static uint8_t {cd.name}[{cd.size}];")
-        lines.append("")
-
         lines.append('extern "C" void* __cuda_sim_get_symbol(const char* name) {')
         for cd in const_decls:
             lines.append(f'    if (std::strcmp(name, "{cd.name}") == 0) return {cd.name};')
@@ -1241,7 +1643,8 @@ def main():
         print("Error: no kernels found in PTX file", file=sys.stderr)
         sys.exit(1)
 
-    cpp_code, diagnostics = generate_cpp(kernels, ptx_parser.const_decls)
+    cpp_code, diagnostics = generate_cpp(kernels, ptx_parser.const_decls,
+                                         ptx_parser.func_defs)
 
     # Print diagnostics
     for d in diagnostics:
