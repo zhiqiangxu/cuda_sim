@@ -1,0 +1,100 @@
+# libethash-cuda CMakeLists.txt — patched for cuda_sim (no GPU required)
+#
+# Instead of using CUDA toolkit's compiler (nvcc) and runtime (libcudart),
+# we compile .cu files as plain C++ with cuda_sim compatibility headers.
+# NVRTC calls still work at runtime via nvcc -ptx (Docker has CUDA toolkit).
+
+# Generate CUDAMiner_kernel.h (embed kernel source as byte array — unchanged)
+add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/CUDAMiner_kernel.h
+    COMMAND ${CMAKE_COMMAND} ARGS
+    -DTXT2STR_SOURCE_FILE="${CMAKE_CURRENT_SOURCE_DIR}/CUDAMiner_kernel.cu"
+    -DTXT2STR_VARIABLE_NAME=CUDAMiner_kernel
+    -DTXT2STR_HEADER_FILE="${CMAKE_CURRENT_BINARY_DIR}/CUDAMiner_kernel.h"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/../cmake/txt2str.cmake"
+    COMMENT "Generating CUDA Kernel Header"
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/CUDAMiner_kernel.cu
+)
+add_custom_target(cuda_kernel DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/CUDAMiner_kernel.h)
+
+# cuda_sim root (set via -DCUDA_SIM_ROOT=... or auto-detect)
+if(NOT CUDA_SIM_ROOT)
+    message(FATAL_ERROR "CUDA_SIM_ROOT not set. Point it to the cuda_sim directory.")
+endif()
+
+message("")
+message("----------------------------------------------------------------------------")
+message("-- Using cuda_sim (CPU simulation) instead of CUDA GPU runtime")
+message("-- cuda_sim root: ${CUDA_SIM_ROOT}")
+message("----------------------------------------------------------------------------")
+message("")
+
+# Source files — use CUDAMiner_cuda_sim.cpp instead of CUDAMiner_cuda.cu
+set(CUDA_SIM_SOURCES
+    CUDAMiner.cpp
+    CUDAMiner_cuda_sim.cpp
+)
+set(CUDA_SIM_HEADERS
+    CUDAMiner.h
+    CUDAMiner_cuda.h
+    ${CMAKE_CURRENT_BINARY_DIR}/CUDAMiner_kernel.h
+)
+
+# Build as regular C++ static library (no nvcc needed)
+add_library(ethash-cuda STATIC ${CUDA_SIM_SOURCES} ${CUDA_SIM_HEADERS})
+add_dependencies(ethash-cuda cuda_kernel)
+
+# cuda_sim include paths (replace CUDA SDK includes)
+target_include_directories(ethash-cuda PUBLIC
+    ${CUDA_SIM_ROOT}/include/compat    # drop-in <cuda.h>, <cuda_runtime.h>, <nvrtc.h>
+    ${CUDA_SIM_ROOT}/include           # cuda_sim implementation headers
+)
+target_include_directories(ethash-cuda PRIVATE .. ${CMAKE_CURRENT_BINARY_DIR})
+
+# Compile flags for cuda_sim .cu-as-cpp compilation
+target_compile_definitions(ethash-cuda PRIVATE
+    CUDA_SIM_HOST_DEVICE_STUBS    # enable threadIdx/blockIdx stubs
+)
+
+# Link dependencies (no CUDA libs needed — cuda_sim is header-only + JIT)
+target_link_libraries(ethash-cuda ethcore ethash progpow Boost::thread)
+
+# dlopen/dlsym needed by JIT engine
+if(UNIX)
+    target_link_libraries(ethash-cuda dl)
+endif()
+
+# Verification test binary
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_verify.cpp")
+    add_executable(test_verify test_verify.cpp CUDAMiner_cuda_sim.cpp)
+    target_include_directories(test_verify PRIVATE
+        ${CUDA_SIM_ROOT}/include/compat
+        ${CUDA_SIM_ROOT}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    target_compile_definitions(test_verify PRIVATE CUDA_SIM_HOST_DEVICE_STUBS)
+    target_link_libraries(test_verify ethash progpow pthread)
+    if(UNIX)
+        target_link_libraries(test_verify dl)
+    endif()
+endif()
+
+# JIT end-to-end test (ProgPow kernel through full NVRTC → PTX → JIT pipeline)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test_jit_progpow.cpp")
+    add_executable(test_jit_progpow test_jit_progpow.cpp)
+    add_dependencies(test_jit_progpow cuda_kernel)
+    target_include_directories(test_jit_progpow PRIVATE
+        ${CUDA_SIM_ROOT}/include/compat
+        ${CUDA_SIM_ROOT}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/..
+        ${CMAKE_CURRENT_BINARY_DIR}
+    )
+    # No CUDA_SIM_HOST_DEVICE_STUBS needed — this test doesn't have device code
+    target_link_libraries(test_jit_progpow ethash progpow pthread)
+    if(UNIX)
+        target_link_libraries(test_jit_progpow dl)
+    endif()
+endif()

@@ -36,6 +36,9 @@ class Param:
     """A kernel parameter."""
     name: str
     ptx_type: str  # "u64", "u32", "s32", "f32", etc.
+    is_struct: bool = False   # True for .param .align N .b8 name[M]
+    struct_size: int = 0      # byte size for struct params
+    struct_align: int = 0     # alignment for struct params
 
     def cpp_type(self) -> str:
         return PTX_TYPE_TO_CPP.get(self.ptx_type, "uint64_t")
@@ -69,6 +72,14 @@ class SharedDecl:
     name: str
     size: int       # total bytes
     offset: int     # offset within shared memory buffer
+
+
+@dataclass
+class ConstDecl:
+    """A .const / __constant__ variable declaration."""
+    name: str
+    size: int       # total bytes
+    align: int      # alignment
 
 
 @dataclass
@@ -135,6 +146,7 @@ class PTXParser:
     def __init__(self, text: str):
         self.lines = text.splitlines()
         self.pos = 0
+        self.const_decls: list[ConstDecl] = []
 
     def parse(self) -> list[KernelDef]:
         kernels = []
@@ -143,6 +155,21 @@ class PTXParser:
             if ".entry" in line:
                 kernels.append(self._parse_kernel())
             else:
+                # Parse .const declarations (module-level)
+                const_match = re.match(
+                    r'\.(?:visible\s+)?\.const\s+(?:\.align\s+(\d+)\s+)?\.(\w+)\s+(\w+)\[(\d+)\]',
+                    line)
+                if const_match:
+                    align = int(const_match.group(1)) if const_match.group(1) else 4
+                    elem_type = const_match.group(2)
+                    cname = const_match.group(3)
+                    count = int(const_match.group(4))
+                    type_sizes = {"b8": 1, "b16": 2, "b32": 4, "b64": 8,
+                                  "u8": 1, "u16": 2, "u32": 4, "u64": 8,
+                                  "s8": 1, "s16": 2, "s32": 4, "s64": 8,
+                                  "f32": 4, "f64": 8}
+                    elem_size = type_sizes.get(elem_type, 1)
+                    self.const_decls.append(ConstDecl(cname, elem_size * count, align))
                 self.pos += 1
         return kernels
 
@@ -163,6 +190,18 @@ class PTXParser:
             if "{" in line:
                 self.pos += 1
                 break
+            # Struct parameter: .param .align N .b8 name[M]
+            struct_param_match = re.search(
+                r'\.param\s+\.align\s+(\d+)\s+\.b8\s+(\w+)\[(\d+)\]', line)
+            if struct_param_match:
+                align = int(struct_param_match.group(1))
+                pname = struct_param_match.group(2)
+                size = int(struct_param_match.group(3))
+                params.append(Param(name=pname, ptx_type="b8",
+                                    is_struct=True, struct_size=size,
+                                    struct_align=align))
+                self.pos += 1
+                continue
             param_match = re.search(r'\.param\s+\.(\w+)\s+(\w+)', line)
             if param_match:
                 params.append(Param(name=param_match.group(2),
@@ -889,7 +928,8 @@ class PTXTranslator:
 # Code generator
 # ---------------------------------------------------------------------------
 
-def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
+def generate_cpp(kernels: list[KernelDef],
+                  const_decls: list[ConstDecl] | None = None) -> tuple[str, list[Diagnostic]]:
     """Generate complete C++ file from translated kernels.
     Returns (cpp_code, diagnostics)."""
     all_diagnostics: list[Diagnostic] = []
@@ -1074,6 +1114,54 @@ def generate_cpp(kernels: list[KernelDef]) -> tuple[str, list[Diagnostic]]:
             lines.append("}")
             lines.append("")
 
+        # --- Generic entry for cuLaunchKernel (void** args unpacking) ---
+        lines.append(f'extern "C"')
+        lines.append(f"void {kernel.name}_launch_generic(void** args,")
+        lines.append(f"    uint32_t gx, uint32_t gy, uint32_t gz,")
+        lines.append(f"    uint32_t bx, uint32_t by, uint32_t bz,")
+        lines.append(f"    uint32_t shared_bytes)")
+        lines.append("{")
+
+        # Unpack args by type
+        generic_call_args = []
+        for i, p in enumerate(kernel.params):
+            if p.is_struct:
+                # Struct: local array + memcpy from args[i]
+                lines.append(f"    uint8_t __p{i}[{p.struct_size}];")
+                lines.append(f"    std::memcpy(__p{i}, args[{i}], {p.struct_size});")
+                # The typed launch expects the struct passed as uint8_t* casted to
+                # the param type (which for struct params is just a u64 holding the pointer).
+                # However, since struct params in PTX are loaded via ld.param into registers,
+                # and our _thread function takes them as uint64_t (address), we pass the address.
+                generic_call_args.append(f"(uint64_t)(uintptr_t)__p{i}")
+            else:
+                cpp_t = p.cpp_type()
+                lines.append(f"    {cpp_t} __p{i} = *({cpp_t}*)args[{i}];")
+                generic_call_args.append(f"__p{i}")
+
+        generic_call_args.append("cuda_sim::dim3{gx, gy, gz}")
+        generic_call_args.append("cuda_sim::dim3{bx, by, bz}")
+        if kernel.has_dynamic_shared:
+            generic_call_args.append("(size_t)shared_bytes")
+
+        lines.append(f"    {kernel.name}_launch({', '.join(generic_call_args)});")
+        lines.append("}")
+        lines.append("")
+
+    # --- __constant__ variable globals and symbol lookup ---
+    if const_decls:
+        lines.append("// --- __constant__ variables ---")
+        for cd in const_decls:
+            lines.append(f"alignas({cd.align}) static uint8_t {cd.name}[{cd.size}];")
+        lines.append("")
+
+        lines.append('extern "C" void* __cuda_sim_get_symbol(const char* name) {')
+        for cd in const_decls:
+            lines.append(f'    if (std::strcmp(name, "{cd.name}") == 0) return {cd.name};')
+        lines.append("    return nullptr;")
+        lines.append("}")
+        lines.append("")
+
     return "\n".join(lines), all_diagnostics
 
 
@@ -1124,6 +1212,13 @@ def generate_header(kernels: list[KernelDef]) -> str:
             lines.append(f"    {(',{0}'.format(chr(10)) + '    ').join(wrapper_params)});")
             lines.append("")
 
+        # Generic entry for cuLaunchKernel
+        lines.append(f'extern "C" void {kernel.name}_launch_generic(void** args,')
+        lines.append(f"    uint32_t gx, uint32_t gy, uint32_t gz,")
+        lines.append(f"    uint32_t bx, uint32_t by, uint32_t bz,")
+        lines.append(f"    uint32_t shared_bytes);")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -1146,7 +1241,7 @@ def main():
         print("Error: no kernels found in PTX file", file=sys.stderr)
         sys.exit(1)
 
-    cpp_code, diagnostics = generate_cpp(kernels)
+    cpp_code, diagnostics = generate_cpp(kernels, ptx_parser.const_decls)
 
     # Print diagnostics
     for d in diagnostics:

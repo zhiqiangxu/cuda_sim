@@ -10,6 +10,8 @@ enum cudaError_t {
     cudaSuccess = 0,
     cudaErrorMemoryAllocation = 2,
     cudaErrorInvalidDevicePointer = 17,
+    cudaErrorInsufficientDriver = 35,
+    cudaErrorNoDevice = 100,
 };
 
 enum cudaMemcpyKind {
@@ -103,7 +105,9 @@ struct AllocTracker {
         std::lock_guard<std::mutex> lock(mtx);
         int leaks = 0;
         size_t leaked_bytes = 0;
-        for (auto& [ptr, info] : allocs) {
+        for (auto it = allocs.begin(); it != allocs.end(); ++it) {
+            auto ptr = it->first;
+            auto& info = it->second;
             if (!info.freed) {
                 // Check redzone on leaked memory too
                 check_redzone(ptr, info);
@@ -189,6 +193,7 @@ inline cudaError_t cudaFree(void* ptr) {
 
 inline cudaError_t cudaMemcpy(void* dst, const void* src,
                                size_t count, cudaMemcpyKind kind) {
+    (void)kind;
     std::memcpy(dst, src, count);
     return cudaSuccess;
 }
@@ -202,6 +207,23 @@ inline cudaError_t cudaDeviceSynchronize() {
     return cudaSuccess;
 }
 
+inline cudaError_t cudaGetLastError() {
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaPeekAtLastError() {
+    return cudaSuccess;
+}
+
+inline const char* cudaGetErrorName(cudaError_t error) {
+    switch (error) {
+        case cudaSuccess: return "cudaSuccess";
+        case cudaErrorMemoryAllocation: return "cudaErrorMemoryAllocation";
+        case cudaErrorInvalidDevicePointer: return "cudaErrorInvalidDevicePointer";
+        default: return "cudaErrorUnknown";
+    }
+}
+
 inline const char* cudaGetErrorString(cudaError_t error) {
     switch (error) {
         case cudaSuccess: return "no error";
@@ -210,3 +232,143 @@ inline const char* cudaGetErrorString(cudaError_t error) {
         default: return "unknown error";
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stream API (synchronous simulation — no actual async)
+// ---------------------------------------------------------------------------
+
+typedef void* cudaStream_t;
+
+// Stream flags (ignored in simulation)
+#define cudaStreamDefault        0x00
+#define cudaStreamNonBlocking    0x01
+
+inline cudaError_t cudaStreamCreate(cudaStream_t* stream) {
+    static int dummy_stream = 0;
+    *stream = &dummy_stream;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaStreamCreateWithFlags(cudaStream_t* stream, unsigned int flags) {
+    (void)flags;
+    return cudaStreamCreate(stream);
+}
+
+inline cudaError_t cudaStreamSynchronize(cudaStream_t stream) {
+    (void)stream;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaStreamDestroy(cudaStream_t stream) {
+    (void)stream;
+    return cudaSuccess;
+}
+
+// ---------------------------------------------------------------------------
+// Pinned memory (CPU simulation — just use regular malloc/free)
+// ---------------------------------------------------------------------------
+
+inline cudaError_t cudaMallocHost(void** ptr, size_t size) {
+    *ptr = std::malloc(size);
+    return *ptr ? cudaSuccess : cudaErrorMemoryAllocation;
+}
+
+// Overload for volatile pointers (e.g., volatile Search_results**)
+template<typename T>
+inline cudaError_t cudaMallocHost(T** ptr, size_t size) {
+    void* p = std::malloc(size);
+    *ptr = static_cast<T*>(p);
+    return p ? cudaSuccess : cudaErrorMemoryAllocation;
+}
+
+inline cudaError_t cudaFreeHost(void* ptr) {
+    std::free(ptr);
+    return cudaSuccess;
+}
+
+// ---------------------------------------------------------------------------
+// Device info
+// ---------------------------------------------------------------------------
+
+struct cudaDeviceProp {
+    char name[256] = "cuda_sim CPU Device";
+    size_t totalGlobalMem = 4ULL * 1024 * 1024 * 1024;  // 4 GB
+    size_t sharedMemPerBlock = 49152;   // 48 KB
+    int maxThreadsPerBlock = 1024;
+    int maxThreadsDim[3] = {1024, 1024, 64};
+    int maxGridSize[3] = {2147483647, 65535, 65535};
+    int warpSize = 32;
+    int multiProcessorCount = 1;
+    int major = 7;
+    int minor = 5;
+    int pciBusID = 0;
+    int pciDeviceID = 0;
+    int pciDomainID = 0;
+    size_t totalConstMem = 65536;
+    int clockRate = 1500000;  // kHz
+    size_t memPitch = 2147483647;
+};
+
+inline cudaError_t cudaGetDeviceCount(int* count) {
+    *count = 1;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaGetDeviceProperties(cudaDeviceProp* prop, int device) {
+    (void)device;
+    *prop = cudaDeviceProp{};
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaSetDevice(int device) {
+    (void)device;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaGetDevice(int* device) {
+    *device = 0;
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaDeviceReset() {
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaDriverGetVersion(int* driverVersion) {
+    *driverVersion = 12060;  // CUDA 12.6
+    return cudaSuccess;
+}
+
+inline cudaError_t cudaRuntimeGetVersion(int* runtimeVersion) {
+    *runtimeVersion = 12060;
+    return cudaSuccess;
+}
+
+// ---------------------------------------------------------------------------
+// Memory info
+// ---------------------------------------------------------------------------
+
+inline cudaError_t cudaMemGetInfo(size_t* free, size_t* total) {
+    // Report simulated GPU memory (4 GB total, 3.5 GB free)
+    if (total) *total = 4ULL * 1024 * 1024 * 1024;
+    if (free)  *free  = 3ULL * 1024 * 1024 * 1024 + 512ULL * 1024 * 1024;
+    return cudaSuccess;
+}
+
+// ---------------------------------------------------------------------------
+// cudaMemcpyToSymbol / cudaMemcpyFromSymbol — __constant__ variables
+// ---------------------------------------------------------------------------
+// NOTE: Requires driver_api.h to be included for symbol lookup.
+// Usage: cudaMemcpyToSymbol(symbol_name, src, size)
+// The macro converts the symbol to a string for runtime lookup.
+
+// Forward declaration — actual implementation needs JIT engine access
+namespace cuda_sim { namespace jit { struct JitEngine; } }
+
+// These are helpers that do the actual memcpy via symbol lookup.
+// Must be called after driver_api.h is included.
+#define cudaMemcpyToSymbol(symbol, src, count, ...) \
+    cudaMemcpyToSymbol_impl(#symbol, src, count)
+
+#define cudaMemcpyFromSymbol(dst, symbol, count, ...) \
+    cudaMemcpyFromSymbol_impl(dst, #symbol, count)

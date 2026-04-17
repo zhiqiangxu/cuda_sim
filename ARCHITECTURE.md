@@ -228,13 +228,15 @@ cuda_sim/
 │   ├── compat/                 # Drop-in replacements for CUDA headers
 │   │   ├── cuda_runtime.h
 │   │   ├── cuda_runtime_api.h
-│   │   ├── cuda.h
+│   │   ├── cuda.h              # includes Driver API (driver_api.h)
+│   │   ├── nvrtc.h             # NVRTC runtime compilation compat
 │   │   ├── cuda_fp16.h
 │   │   └── device_launch_parameters.h
 │   └── cuda_sim/
-│       ├── cuda_runtime_api.h  # cudaMalloc/Free/Memcpy + error detection + redzone
+│       ├── cuda_runtime_api.h  # cudaMalloc/Free/Memcpy + streams + error detection
 │       ├── runtime.h           # dim3
-│       ├── device_atomic.h     # atomic_add, atomic_cas, etc.
+│       ├── driver_api.h        # CUDA Driver API + JIT engine
+│       ├── device_atomic.h     # atomic_add, atomic_cas, atomic_inc, etc.
 │       ├── barrier.h           # SimpleBarrier for __syncthreads()
 │       └── warp.h              # WarpContext + bit ops (popc, clz, etc.)
 │
@@ -277,6 +279,74 @@ cuda_sim/
 **Bit ops**: popc, clz, bfind, brev, bfe, bfi, ffs
 
 **Misc**: isspacep, nop, membar, fence
+
+---
+
+## Runtime JIT: CUDA Driver API + NVRTC Support
+
+cuda_sim supports two modes:
+
+### Mode 1: Compile-time (existing)
+```
+.cu → nvcc -ptx → ptx2cpp.py → kernel_cpu.cpp → g++ → binary
+```
+For projects with static kernels. No runtime overhead.
+
+### Mode 2: Runtime JIT (new)
+```
+Program runs → cuModuleLoadDataEx(ptx_text)
+                    → ptx2cpp.py (translate)
+                    → g++ -shared (compile to .so)
+                    → dlopen (load)
+               cuLaunchKernel(func, grid, block, args)
+                    → dlsym (find generic entry)
+                    → call with void** args unpacking
+```
+For projects using NVRTC or Driver API (e.g., quai-gpu-miner).
+
+### How cuLaunchKernel works with void** args
+
+cuLaunchKernel passes parameters as `void** args` — an array of pointers
+with no type information. We solve this by generating an additional
+"generic entry" function at translate time:
+
+```
+PTX declares:                    ptx2cpp.py generates:
+  .param .u64 start_nonce          void kernel_launch_generic(void** args, ...) {
+  .param .u32 n                        uint64_t p0 = *(uint64_t*)args[0];
+  .param .f32 alpha                    uint32_t p1 = *(uint32_t*)args[1];
+                                       float p2 = *(float*)args[2];
+                                       kernel_launch(p0, p1, p2, grid, block);
+                                   }
+```
+
+Type information comes from PTX `.param` declarations — the same info
+ptx2cpp.py already uses for the typed launch function.
+
+### __constant__ variable support
+
+PTX `__constant__` variables become global variables in the generated .so.
+A symbol lookup function is also generated:
+
+```cpp
+extern "C" void* __cuda_sim_get_symbol(const char* name) {
+    if (strcmp(name, "d_header") == 0) return &d_header;
+    // ...
+}
+```
+
+`cudaMemcpyToSymbol(d_header, &val, size)` → finds address via
+symbol lookup → memcpy.
+
+### NVRTC flow
+
+```
+nvrtcCreateProgram(src)     → store source text
+nvrtcCompileProgram(opts)   → call nvcc -ptx (Docker or local)
+nvrtcGetPTX()               → return generated PTX
+cuModuleLoadDataEx(ptx)     → JIT compile to .so (see above)
+cuLaunchKernel(func, args)  → call generic entry
+```
 
 ---
 

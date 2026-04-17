@@ -57,4 +57,28 @@ inline float atomic_add(float* address, float val) {
     return old_float;
 }
 
+// atomicInc: if old >= val, set to 0; else increment by 1. Returns old value.
+inline uint32_t atomic_inc(uint32_t* address, uint32_t val) {
+    auto* a = reinterpret_cast<std::atomic<uint32_t>*>(address);
+    uint32_t old_val = a->load(std::memory_order_relaxed);
+    uint32_t new_val;
+    do {
+        new_val = (old_val >= val) ? 0 : (old_val + 1);
+    } while (!a->compare_exchange_weak(old_val, new_val,
+                                        std::memory_order_relaxed));
+    return old_val;
+}
+
+// atomicDec: if old == 0 || old > val, set to val; else decrement by 1. Returns old value.
+inline uint32_t atomic_dec(uint32_t* address, uint32_t val) {
+    auto* a = reinterpret_cast<std::atomic<uint32_t>*>(address);
+    uint32_t old_val = a->load(std::memory_order_relaxed);
+    uint32_t new_val;
+    do {
+        new_val = (old_val == 0 || old_val > val) ? val : (old_val - 1);
+    } while (!a->compare_exchange_weak(old_val, new_val,
+                                        std::memory_order_relaxed));
+    return old_val;
+}
+
 } // namespace cuda_sim
