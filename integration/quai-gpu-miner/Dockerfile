@@ -32,7 +32,10 @@ RUN cp /build/cuda_sim/integration/quai-gpu-miner/patches/CMakeLists.cuda_sim.tx
     && cp /build/cuda_sim/integration/quai-gpu-miner/patches/test_jit_progpow.cpp \
        /build/quai-gpu-miner/libethash-cuda/test_jit_progpow.cpp \
     && cp /build/cuda_sim/integration/quai-gpu-miner/patches/test_correctness.cpp \
-       /build/quai-gpu-miner/libethash-cuda/test_correctness.cpp
+       /build/quai-gpu-miner/libethash-cuda/test_correctness.cpp \
+    && cd /build/quai-gpu-miner \
+    && sed -i 's/current.boundary = h256(dev::getTargetFromDiff(m_difficulty));/current.boundary = h256(dev::getTargetFromDiff(m_difficulty));\n    current.epoch = current.block \/ 2147483647;/' \
+       libpoolprotocols/testing/SimulateClient.cpp
 
 # Build quai-gpu-miner + verification tests
 RUN cd /build/quai-gpu-miner \

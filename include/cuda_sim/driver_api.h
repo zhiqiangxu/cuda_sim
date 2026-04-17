@@ -424,6 +424,6 @@ inline CUresult cuDeviceGetAttribute(int* value, CUdevice_attribute attrib, CUde
 
 inline CUresult cuDeviceTotalMem(size_t* bytes, CUdevice dev) {
     (void)dev;
-    *bytes = 4ULL * 1024 * 1024 * 1024;  // 4 GB
+    *bytes = 8ULL * 1024 * 1024 * 1024;  // 8 GB
     return CUDA_SUCCESS;
 }

@@ -292,7 +292,7 @@ inline cudaError_t cudaFreeHost(void* ptr) {
 
 struct cudaDeviceProp {
     char name[256] = "cuda_sim CPU Device";
-    size_t totalGlobalMem = 4ULL * 1024 * 1024 * 1024;  // 4 GB
+    size_t totalGlobalMem = 8ULL * 1024 * 1024 * 1024;  // 8 GB
     size_t sharedMemPerBlock = 49152;   // 48 KB
     int maxThreadsPerBlock = 1024;
     int maxThreadsDim[3] = {1024, 1024, 64};
@@ -349,9 +349,9 @@ inline cudaError_t cudaRuntimeGetVersion(int* runtimeVersion) {
 // ---------------------------------------------------------------------------
 
 inline cudaError_t cudaMemGetInfo(size_t* free, size_t* total) {
-    // Report simulated GPU memory (4 GB total, 3.5 GB free)
-    if (total) *total = 4ULL * 1024 * 1024 * 1024;
-    if (free)  *free  = 3ULL * 1024 * 1024 * 1024 + 512ULL * 1024 * 1024;
+    // Report simulated GPU memory — must be large enough for DAG (~4GB for epoch 0)
+    if (total) *total = 8ULL * 1024 * 1024 * 1024;  // 8 GB
+    if (free)  *free  = 7ULL * 1024 * 1024 * 1024;  // 7 GB free
     return cudaSuccess;
 }
 
