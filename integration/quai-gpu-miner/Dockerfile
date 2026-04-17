@@ -30,7 +30,9 @@ RUN cp /build/cuda_sim/integration/quai-gpu-miner/patches/CMakeLists.cuda_sim.tx
     && cp /build/cuda_sim/integration/quai-gpu-miner/patches/test_verify.cpp \
        /build/quai-gpu-miner/libethash-cuda/test_verify.cpp \
     && cp /build/cuda_sim/integration/quai-gpu-miner/patches/test_jit_progpow.cpp \
-       /build/quai-gpu-miner/libethash-cuda/test_jit_progpow.cpp
+       /build/quai-gpu-miner/libethash-cuda/test_jit_progpow.cpp \
+    && cp /build/cuda_sim/integration/quai-gpu-miner/patches/test_correctness.cpp \
+       /build/quai-gpu-miner/libethash-cuda/test_correctness.cpp
 
 # Build quai-gpu-miner + verification tests
 RUN cd /build/quai-gpu-miner \
@@ -55,8 +57,8 @@ RUN cd /build/quai-gpu-miner/build \
     ls -la /tmp/cuda_sim_jit/ 2>/dev/null ; \
     echo "=== ptx2cpp output ===" ; \
     cat /tmp/cuda_sim_jit/*_cpu.cpp 2>/dev/null | head -50 ; \
-    echo "=== g++ errors ===" ; \
-    cd /tmp/cuda_sim_jit && g++ -std=c++17 -O2 -fPIC -shared \
-      -I/build/cuda_sim/include/compat -I/build/cuda_sim/include \
-      *_cpu.cpp -o /dev/null 2>&1 | head -30 ; \
+    echo "" && \
+    echo "=== Running correctness test ===" && \
+    rm -rf /tmp/cuda_sim_jit && \
+    CUDA_SIM_ROOT=/build/cuda_sim timeout 600 ./libethash-cuda/test_correctness ; \
     true
