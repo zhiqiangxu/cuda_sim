@@ -191,15 +191,30 @@ int main() {
         return 1;
     }
 
-    // Compare run1 vs run2 — only compare mix hashes (gid order varies due to threading)
-    // All lanes produce the same mix hash, so just compare result[0].mix
+    // Compare run1 vs run2 — find matching gid to compare same nonce
     bool deterministic = (run1.count > 0 && output.count > 0);
     if (deterministic) {
-        uint32_t r1_idx = 0, r2_idx = 0;  // first valid result in each
-        deterministic = (memcmp(run1.result[r1_idx].mix, output.result[r2_idx].mix, 32) == 0);
-        if (!deterministic) {
-            printf("  run1 mix: %08x%08x...\n", run1.result[0].mix[0], run1.result[0].mix[1]);
-            printf("  run2 mix: %08x%08x...\n", output.result[0].mix[0], output.result[0].mix[1]);
+        // Find a gid that appears in both runs and compare its mix
+        bool found_match = false;
+        uint32_t n1 = run1.count < MAX_SEARCH_RESULTS ? run1.count : MAX_SEARCH_RESULTS;
+        uint32_t n2 = output.count < MAX_SEARCH_RESULTS ? output.count : MAX_SEARCH_RESULTS;
+        for (uint32_t i = 0; i < n1 && !found_match; i++) {
+            for (uint32_t j = 0; j < n2; j++) {
+                if (run1.result[i].gid == output.result[j].gid) {
+                    deterministic = (memcmp(run1.result[i].mix, output.result[j].mix, 32) == 0);
+                    if (!deterministic) {
+                        printf("  gid=%u: run1=%08x%08x run2=%08x%08x\n",
+                               run1.result[i].gid,
+                               run1.result[i].mix[0], run1.result[i].mix[1],
+                               output.result[j].mix[0], output.result[j].mix[1]);
+                    }
+                    found_match = true; break;
+                }
+            }
+        }
+        if (!found_match) {
+            printf("  no matching gid between runs\n");
+            deterministic = false;
         }
     }
     printf("  deterministic: %s\n", deterministic ? "PASS" : "FAIL");

@@ -227,17 +227,18 @@ int main() {
         if (!mix_nonzero) { failed++; } else { passed++; }
         if (t > 0 && !mix_differs) { printf("    WARNING: same mix for different nonce\n"); }
 
-        // Verify all results have same mix (all lanes should agree)
+        // Each result is from a different lane processing a different nonce
+        // (lane h processes start_nonce + h). So different mix hashes are expected.
         uint32_t n_results = output.count < MAX_SEARCH_RESULTS ? output.count : MAX_SEARCH_RESULTS;
-        bool lanes_agree = true;
+        bool results_vary = false;
         for (uint32_t r = 1; r < n_results; r++) {
             if (memcmp(output.result[0].mix, output.result[r].mix, 32) != 0) {
-                lanes_agree = false;
-                printf("    FAIL: result[0] != result[%u]\n", r);
+                results_vary = true; break;
             }
         }
-        if (lanes_agree && n_results > 1) {
-            printf("    all %u results have matching mix (lanes agree)\n", n_results);
+        if (n_results > 1) {
+            printf("    %u results, mix %s (each lane = different nonce)\n",
+                   n_results, results_vary ? "vary as expected" : "identical (unexpected)");
         }
 
         memcpy(prev_mix, output.result[0].mix, 32);
