@@ -214,8 +214,11 @@ int main() {
         bool mix_differs = (t > 0 && memcmp(output.result[0].mix, prev_mix, 32) != 0);
         bool first = (t == 0);
 
-        printf("  nonce=%5llu: mix=%08x%08x... count=%u %.0fms %s%s\n",
+        // Compute expected seed from our reference keccak
+        uint64_t seed = keccak_seed(h32, nonce);
+        printf("  nonce=%5llu: seed=%016llx mix=%08x%08x... count=%u %.0fms %s%s\n",
                (unsigned long long)nonce,
+               (unsigned long long)seed,
                output.result[0].mix[0], output.result[0].mix[1],
                output.count, ms,
                mix_nonzero ? "nonzero" : "ZERO",

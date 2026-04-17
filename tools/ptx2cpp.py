@@ -875,8 +875,18 @@ class PTXTranslator:
 
         # --- Move ---
         if op == "mov":
+            # mov.b64 with 3 operands: either split or merge
+            if len(ops) == 3 and "b64" in mods:
+                # Determine direction by checking register types:
+                # {%r_lo, %r_hi}, %rd → split (first two are 32-bit r[])
+                # %rd, {%r_lo, %r_hi} → merge (first is 64-bit rd[])
+                if "rd[" in ops[0]:
+                    # merge: rd = {lo, hi} → rd = ((uint64_t)hi << 32) | lo
+                    return f"{ops[0]} = ((uint64_t)(uint32_t){ops[2]} << 32) | (uint64_t)(uint32_t){ops[1]};"
+                else:
+                    # split: {lo, hi} = rd → lo = (uint32_t)rd; hi = (uint32_t)(rd >> 32)
+                    return f"{ops[0]} = (uint32_t)({ops[2]}); {ops[1]} = (uint32_t)({ops[2]} >> 32);"
             # Check if source is a shared memory variable name
-            # On GPU, shared addresses are 32-bit offsets; we store the offset
             raw_src = raw_ops[1] if len(raw_ops) > 1 else ""
             if raw_src in self.shared_map:
                 return f"{ops[0]} = {self.shared_map[raw_src]}; /* shared addr: {raw_src} */"
