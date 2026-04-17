@@ -135,12 +135,34 @@ inline nvrtcResult nvrtcCompileProgram(nvrtcProgram prog,
         prog->ptx = ss.str();
     }
 
-    // Build lowered name mappings (extern "C" functions don't get mangled)
+    // Build lowered name mappings by searching PTX for .entry with matching names
     for (auto& expr : prog->name_expressions) {
-        // Strip leading '&' if present
         std::string clean = expr;
         if (!clean.empty() && clean[0] == '&') clean = clean.substr(1);
-        prog->lowered_names.push_back({expr, clean});
+
+        // Search the compiled PTX for .entry lines containing the kernel name
+        std::string lowered = clean;  // default: unmangled
+        size_t pos = 0;
+        while ((pos = prog->ptx.find(".entry", pos)) != std::string::npos) {
+            // Find the kernel name on this line
+            size_t line_end = prog->ptx.find('\n', pos);
+            std::string entry_line = prog->ptx.substr(pos, line_end - pos);
+            // Look for the clean name as a substring (mangled names contain the original)
+            if (entry_line.find(clean) != std::string::npos) {
+                // Extract the full mangled name: .entry MANGLED_NAME(
+                size_t name_start = entry_line.find(' ', 6);  // after ".entry"
+                if (name_start != std::string::npos) {
+                    name_start++;  // skip space
+                    size_t name_end = entry_line.find('(', name_start);
+                    if (name_end == std::string::npos) name_end = entry_line.size();
+                    lowered = entry_line.substr(name_start, name_end - name_start);
+                    // Trim whitespace
+                    while (!lowered.empty() && lowered.back() == ' ') lowered.pop_back();
+                }
+            }
+            pos = line_end != std::string::npos ? line_end + 1 : prog->ptx.size();
+        }
+        prog->lowered_names.push_back({expr, lowered});
     }
 
     return NVRTC_SUCCESS;
