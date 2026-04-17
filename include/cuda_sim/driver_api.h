@@ -142,7 +142,7 @@ struct JitEngine {
             }
 
             // Compile C++ → .so
-            cmd = "g++ -std=c++17 -O2 -fPIC " + so_flag +
+            cmd = "g++ -std=c++17 -O0 -g -fPIC " + so_flag +
                 " -I" + include_compat_path +
                 " -I" + include_path +
                 " " + cpp_path +

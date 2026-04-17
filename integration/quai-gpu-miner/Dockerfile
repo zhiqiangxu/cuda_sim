@@ -48,6 +48,7 @@ RUN cd /build/quai-gpu-miner/build \
     && ./libethash-cuda/test_verify \
     && echo "" \
     && echo "=== Running JIT ProgPow test ===" \
+    && rm -rf /tmp/cuda_sim_jit \
     && CUDA_SIM_ROOT=/build/cuda_sim ./libethash-cuda/test_jit_progpow ; \
     echo "JIT test exit code: $?" ; \
     echo "=== JIT cache contents ===" ; \
