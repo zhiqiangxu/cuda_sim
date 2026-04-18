@@ -23,26 +23,111 @@ Program → nvrtcCompileProgram(src) → PTX → cuModuleLoadDataEx → ptx2cpp.
 
 No GPU needed at runtime. nvcc runs inside Docker for cross-platform support.
 
-## Quick start
+## Quick start — compile-time mode
+
+```cuda
+// kernel.cu — same kernel runs on GPU or CPU
+extern "C" __global__ void saxpy(int n, float a, float *x, float *y) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a * x[i] + y[i];
+}
+```
+
+```cpp
+// main.cpp — standard CUDA host code, no changes needed
+#include <cstdio>
+#include <cuda_runtime.h>
+#include "kernel_cpu.h"
+
+int main() {
+    float x[] = {1,2,3,4,5,6,7,8}, y[] = {10,20,30,40,50,60,70,80};
+    float *d_x, *d_y;
+    cudaMalloc((void**)&d_x, sizeof(x));
+    cudaMalloc((void**)&d_y, sizeof(y));
+    cudaMemcpy(d_x, x, sizeof(x), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_y, y, sizeof(y), cudaMemcpyHostToDevice);
+
+    saxpy_launch(8, 2.0f, d_x, d_y, dim3(1), dim3(8));  // y = 2*x + y
+
+    cudaMemcpy(y, d_y, sizeof(y), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < 8; i++) printf("%.0f ", y[i]);
+    // Output: 12 24 36 48 60 72 84 96
+}
+```
 
 ```bash
-# Generate PTX using Docker (one-time image pull ~3.5GB)
-docker run --rm -v $(pwd)/examples/vector_add:/src \
+# Step 1: Generate PTX (Docker, one-time ~3.5GB pull)
+docker run --rm -v $(pwd)/examples/hello_compile_time:/src \
     nvidia/cuda:12.6.0-devel-ubuntu22.04 \
     nvcc -ptx /src/kernel.cu -o /src/kernel.ptx
 
-# Translate PTX to C++ (also generates kernel_cpu.h with declarations)
-python3 tools/ptx2cpp.py examples/vector_add/kernel.ptx \
-    -o examples/vector_add/kernel_cpu.cpp \
-    -H examples/vector_add/kernel_cpu.h
+# Step 2: Translate PTX → C++
+python3 tools/ptx2cpp.py kernel.ptx -o kernel_cpu.cpp -H kernel_cpu.h
 
-# Compile and run
-g++ -std=c++17 -O2 -Iinclude/compat -Iinclude \
-    examples/vector_add/main.cpp \
-    examples/vector_add/kernel_cpu.cpp \
-    -o vector_add
-./vector_add
-# PASS: all 1024 elements correct
+# Step 3: Compile and run — no GPU needed
+g++ -std=c++17 -O2 -Iinclude/compat -Iinclude main.cpp kernel_cpu.cpp -o saxpy
+./saxpy
+# 12 24 36 48 60 72 84 96
+```
+
+## Quick start — runtime JIT mode
+
+For programs that compile kernels at runtime (no pre-generated PTX needed):
+
+```cpp
+// main.cpp — uses NVRTC + Driver API, same as real CUDA
+#include <cstdio>
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <nvrtc.h>
+
+const char* src = R"(
+extern "C" __global__ void saxpy(int n, float a, float *x, float *y) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) y[i] = a * x[i] + y[i];
+}
+)";
+
+int main() {
+    float x[] = {1,2,3,4,5,6,7,8}, y[] = {10,20,30,40,50,60,70,80};
+    float *d_x, *d_y;
+    cudaMalloc((void**)&d_x, sizeof(x));
+    cudaMalloc((void**)&d_y, sizeof(y));
+    cudaMemcpy(d_x, x, sizeof(x), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_y, y, sizeof(y), cudaMemcpyHostToDevice);
+
+    // Compile at runtime: source → PTX → CPU code (.so)
+    nvrtcProgram prog;
+    nvrtcCreateProgram(&prog, src, "saxpy.cu", 0, NULL, NULL);
+    nvrtcCompileProgram(prog, 0, NULL);
+    size_t ptx_size;
+    nvrtcGetPTXSize(prog, &ptx_size);
+    char* ptx = new char[ptx_size];
+    nvrtcGetPTX(prog, ptx);
+    nvrtcDestroyProgram(&prog);
+
+    CUmodule mod;
+    cuModuleLoadDataEx(&mod, ptx, 0, NULL, NULL);  // JIT: ptx2cpp.py → g++ → .so
+    CUfunction func;
+    cuModuleGetFunction(&func, mod, "saxpy");
+    delete[] ptx;
+
+    // Launch
+    int n = 8; float a = 2.0f; float *px = d_x, *py = d_y;
+    void* args[] = {&n, &a, &px, &py};
+    cuLaunchKernel(func, 1,1,1, 8,1,1, 0, NULL, args, NULL);
+
+    cudaMemcpy(y, d_y, sizeof(y), cudaMemcpyDeviceToHost);
+    for (int i = 0; i < 8; i++) printf("%.0f ", y[i]);
+    // Output: 12 24 36 48 60 72 84 96
+}
+```
+
+```bash
+# Build and run (needs nvcc for NVRTC, python3, g++ at runtime)
+g++ -std=c++17 -O2 -Iinclude/compat -Iinclude main.cpp -o saxpy -ldl
+CUDA_SIM_ROOT=/path/to/cuda_sim ./saxpy
+# 12 24 36 48 60 72 84 96
 ```
 
 ## Using CMake
@@ -119,29 +204,7 @@ int main() {
 
 Compat headers intercept `<cuda_runtime.h>`, `<cuda.h>`, `<nvrtc.h>`, `<device_launch_parameters.h>`, `<cuda_fp16.h>`, etc.
 
-## Runtime JIT (CUDA Driver API + NVRTC)
-
-For projects that compile kernels at runtime (e.g., GPU miners):
-
-```cpp
-#include <nvrtc.h>
-#include <cuda.h>
-
-// Compile kernel source to PTX
-nvrtcCreateProgram(&prog, kernel_src, "kernel.cu", 0, NULL, NULL);
-nvrtcCompileProgram(prog, num_opts, opts);  // calls nvcc -ptx
-nvrtcGetPTX(prog, ptx);
-
-// Load PTX module (JIT: ptx2cpp.py → g++ → .so → dlopen)
-cuModuleLoadDataEx(&module, ptx, 0, NULL, NULL);
-cuModuleGetFunction(&func, module, "my_kernel");
-
-// Launch with void** args (type-safe unpacking via _launch_generic)
-void* args[] = {&nonce, &header, &target, &dag_ptr, &output_ptr};
-cuLaunchKernel(func, gridX, 1, 1, blockX, 1, 1, 0, stream, args, NULL);
-```
-
-Verified with quai-gpu-miner's ProgPow kernel: 56KB PTX, 1116 instructions, `.func` calls, shared memory, warp shuffles.
+Both modes produce identical output (`12 24 36 48 60 72 84 96`) — same as real CUDA on GPU.
 
 ## Examples
 
